@@ -17,10 +17,20 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock
 
-import numpy as np
 import pytest
 
-from vertai.local.models import (
+# numpy is an optional dependency (transitive via whisper/torch). The tests that
+# need it are integration tests guarded below; importing it at module top level
+# would break collection in a lightweight CI environment without numpy.
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - exercised in CI without numpy
+    np = None  # type: ignore[assignment]
+
+requires_numpy = pytest.mark.skipif(np is None, reason="numpy not installed")
+
+
+from vertai.local.models import (  # noqa: E402
     AVAILABLE_MODELS,
     EmbeddingModel,
     HardwareRequirements,
@@ -517,10 +527,12 @@ def _install_fake_st(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     return fake_pkg
 
 
+@requires_numpy
 class TestManagerWithFakeLibraries:
     """Exercise the manager's real download/load code paths by stubbing only
     the *external* libraries (whisper / sentence-transformers), never the
-    manager's own logic."""
+    manager's own logic. Requires numpy (used by the fake whisper audio
+    buffers); skipped in lightweight CI without numpy."""
 
     def test_download_whisper_success(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -951,7 +963,11 @@ class TestWhisperModel:
         assert result["segments"] == []
 
 
+@requires_numpy
 class TestEmbeddingModel:
+    """EmbeddingModel.similarity/search use numpy (dot/norm/argsort), so these
+    tests require numpy. Skipped in lightweight CI without numpy."""
+
     def test_creation(self) -> None:
         mock_model = Mock()
         mock_model.encode.return_value = [0.1, 0.2, 0.3]

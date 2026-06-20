@@ -1,5 +1,14 @@
 # AI Agent SDK 设计规范
 
+> ⚠️ **历史文档（2026-06-06 原始设计）**。本文件是 v0.1.x 时期的早期规划，包含许多
+> **未实现**的模块（MultiAgent / HumanLoop / Permission / AuditLog / Compliance /
+> CostTracker / DataCleaner 等）。这些能力的当前状态以 `docs/ARCHITECTURE.md`
+> （实际契约）和 `docs/ROADMAP.md`（1.0 范围与 1.x 后置清单）为准。
+>
+> 本文档保留作历史参考，**不代表当前实现或 1.0 目标**。架构已重构为本地优先、轻量
+> 的 Agent SDK（见 ARCHITECTURE.md）；上述模块中的一部分（multi-agent / human-loop /
+> cost-tracking / data-cleaning / 高级可观测性）已明确移至 1.x 后置增强，不在 1.0 范围。
+
 ## 项目概述
 
 **项目名称**: AI Agent SDK  

@@ -1,19 +1,29 @@
-"""
-StructuredOutput - Extract structured data from unstructured text.
+"""StructuredOutput - extract structured data from unstructured text.
 
-Provides JSON Schema validation with automatic retry correction when
-output doesn't conform to the expected schema.
+Provides JSON-Schema-style validation with automatic retry correction when the
+extracted output does not conform to the expected schema.
 
-支持两种模式：
-1. LLM 模式：传入 LLMEngine 进行语义理解提取（推荐，生产环境使用）
-2. 本地模式：使用正则表达式提取（仅测试用，精度有限）
+Two extraction modes are supported:
+
+1. LLM mode: pass an ``LLMEngine`` for semantic understanding extraction
+   (recommended for production use). The LLM output is schema-validated, with
+   retry on validation failure.
+2. Local mode: pure regex extraction. This is only suitable for testing and
+   simple inputs; precision is limited.
+
+The local ``string`` parser is intentionally *generic* (returns the first
+meaningful token). A small number of field names (``name`` / ``姓名`` /
+``名字``) trigger a documented *domain-example heuristic* that recognises the
+common Chinese reimbursement/purchase phrasing ``<name>报销|采购|...``. This
+heuristic is not part of the general contract; rely on the LLM mode for
+robust extraction.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -29,6 +39,13 @@ CHINESE_NUMBERS = {
 }
 DEFAULT_MAX_RETRIES = 3
 
+# Field names that trigger the documented Chinese-name domain-example
+# heuristic. This is NOT a generic contract — it only recognises the
+# "<name>报销|采购|支付|预|于" reimbursement/purchase phrasing. Generic string
+# extraction is used for every other field name.
+_CHINESE_NAME_FIELD_HINTS = frozenset({"name", "姓名", "名字", "buyer"})
+_CHINESE_NAME_CONTEXT_PATTERN = re.compile(r"[一-龥]{2,4}(?=报|采|支|付|预|于)")
+
 
 @dataclass
 class ExtractionConfig:
@@ -39,7 +56,14 @@ class ExtractionConfig:
 
 @dataclass
 class ExtractionResult:
-    """Result of structured extraction."""
+    """Result of structured extraction.
+
+    Attributes:
+        data: Extracted key-value mapping (empty on failure).
+        success: Whether schema validation passed for all fields.
+        retries: Number of correction retries performed.
+        error: Optional human-readable error description.
+    """
     data: dict[str, Any]
     success: bool
     retries: int = 0
@@ -52,12 +76,10 @@ class SchemaValidationError(Exception):
 
 
 class StructuredOutput:
-    """
-    Extract structured data from unstructured text with schema validation.
+    """Extract structured data from unstructured text with schema validation.
 
-    支持两种提取模式：
+    Examples - LLM mode (recommended for production):
 
-    示例 - LLM 模式（推荐，生产环境）:
         >>> from vertai import LLMEngine, LLMConfig, ModelProvider
         >>> llm = LLMEngine(LLMConfig(
         ...     provider=ModelProvider.DEEPSEEK,
@@ -69,10 +91,11 @@ class StructuredOutput:
         >>> result.data
         {'name': '张三', 'amount': 500}
 
-    示例 - 本地模式（仅测试）:
-        >>> schema = {"name": "string", "amount": "number"}
+    Examples - local mode (testing only):
+
+        >>> schema = {"amount": "number"}
         >>> output = StructuredOutput(schema)
-        >>> result = output.extract("张三报销500元")  # 使用正则提取
+        >>> result = output.extract("金额500元")  # regex extraction
     """
 
     def __init__(
@@ -83,18 +106,17 @@ class StructuredOutput:
         max_retries: int = DEFAULT_MAX_RETRIES,
         strict: bool = True,
         llm: Optional["LLMEngine"] = None,
-    ):
-        """
-        Initialize StructuredOutput with schema definition.
+    ) -> None:
+        """Initialize StructuredOutput with schema definition.
 
         Args:
             schema: Schema definition mapping field names to types.
                     Types: "string", "number", "integer", "boolean",
                            "enum[val1,val2,...]", "array", "object"
-            config: ExtractionConfig instance (overrides max_retries/strict params)
-            max_retries: Maximum retry attempts for correction
-            strict: If True, raise exception on validation failure after retries
-            llm: LLMEngine for semantic extraction (推荐用于生产环境)
+            config: ExtractionConfig instance (overrides max_retries/strict).
+            max_retries: Maximum retry attempts for correction.
+            strict: If True, raise on validation failure after retries.
+            llm: LLMEngine for semantic extraction (recommended for production).
         """
         self.schema = schema
         self._llm = llm
@@ -121,36 +143,39 @@ class StructuredOutput:
         return self._config.strict
 
     def extract(self, text: str) -> ExtractionResult:
-        """
-        Extract structured data from text.
+        """Extract structured data from text.
 
-        如果提供了 LLM，使用 LLM 进行语义提取（推荐）。
-        否则使用本地正则提取（仅测试用）。
+        Uses the LLM for semantic extraction when one was provided; otherwise
+        falls back to local regex extraction (testing only).
 
         Args:
             text: Unstructured text to extract data from.
 
         Returns:
             ExtractionResult with data, success status, and retry count.
+
+        Raises:
+            SchemaValidationError: In strict mode when validation fails after
+                all retries.
         """
-        # LLM 模式：使用语义理解提取
+        # LLM mode: semantic extraction with schema validation + retry.
         if self._llm is not None:
             return self._extract_with_llm(text)
 
-        # 本地模式：使用正则提取
+        # Local mode: regex extraction.
         result = self._extract_initial(text)
 
         if result.success:
             return result
 
-        # Retry with corrections
+        # Retry with corrections.
         for attempt in range(self.max_retries):
             corrected = self._correct_extraction(text, result, attempt)
             if corrected.success:
                 corrected.retries = attempt + 1
                 return corrected
 
-        # All retries exhausted
+        # All retries exhausted.
         if self.strict:
             raise SchemaValidationError(
                 f"Failed to extract valid data after {self.max_retries} retries. "
@@ -165,44 +190,91 @@ class StructuredOutput:
         )
 
     def _extract_with_llm(self, text: str) -> ExtractionResult:
-        """使用 LLM 进行语义提取"""
+        """Extract using the LLM, then schema-validate with retry.
+
+        The raw LLM JSON is validated field-by-field via ``_validate_field``.
+        Invalid fields are dropped and the LLM is re-prompted with the
+        validation errors, up to ``max_retries`` times.
+        """
+        llm = self._llm
+        assert llm is not None  # narrowed by caller
+
         schema_desc = json.dumps(self.schema, ensure_ascii=False)
-        prompt = f"""从以下文本中提取结构化数据。
+        prompt = (
+            "Extract structured data from the following text.\n\n"
+            f"Text: {text}\n\n"
+            f"Required fields and types:\n{schema_desc}\n\n"
+            "Return only a JSON object. If a field cannot be extracted, set it "
+            "to null."
+        )
 
-文本: {text}
+        last_error: Optional[str] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                result = llm.generate(prompt)
+                content = result.content.strip()
 
-需要的字段和类型:
-{schema_desc}
+                # Strip optional ```json ... ``` fences.
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0].strip()
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0].strip()
 
-请以 JSON 格式返回提取结果，只返回 JSON 对象，不要其他内容。
-如果某个字段无法从文本中提取，请设为 null。
-"""
-        try:
-            result = self._llm.generate(prompt)
-            content = result.content.strip()
+                data: dict[str, Any] = json.loads(content)
+            except json.JSONDecodeError as e:
+                last_error = f"JSON parse error: {e}"
+                continue
+            except Exception as e:  # network / provider error
+                last_error = str(e)
+                continue
 
-            # 尝试解析 JSON
-            # 可能包含 ```json ... ``` 包裹
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-
-            data = json.loads(content)
-
-            # 验证并转换类型
-            validated_data = {}
+            # Schema-validate every field. Collect failures so we can
+            # re-prompt the LLM with actionable feedback.
+            validation_errors: list[str] = []
+            validated_data: dict[str, Any] = {}
             for field_name, field_type in self.schema.items():
                 value = data.get(field_name)
-                if value is not None:
+                if value is None:
+                    validation_errors.append(
+                        f"{field_name}: missing or null"
+                    )
+                    continue
+                try:
+                    self._validate_field(value, field_type)
                     validated_data[field_name] = value
+                except ValueError as e:
+                    validation_errors.append(f"{field_name}: {e}")
 
-            return ExtractionResult(data=validated_data, success=True)
+            if not validation_errors:
+                return ExtractionResult(
+                    data=validated_data,
+                    success=True,
+                    retries=attempt,
+                )
 
-        except json.JSONDecodeError as e:
-            return ExtractionResult(data={}, success=False, error=f"JSON parse error: {e}")
-        except Exception as e:
-            return ExtractionResult(data={}, success=False, error=str(e))
+            last_error = "; ".join(validation_errors)
+            prompt = (
+                "Extract structured data from the following text.\n\n"
+                f"Text: {text}\n\n"
+                f"Required fields and types:\n{schema_desc}\n\n"
+                "Return only a JSON object. If a field cannot be extracted, "
+                "set it to null.\n\n"
+                f"Your previous answer had these validation errors:\n"
+                f"{last_error}\n\nPlease correct them."
+            )
+
+        # Exhausted retries.
+        if self.strict:
+            raise SchemaValidationError(
+                f"LLM extraction failed schema validation after "
+                f"{self.max_retries} retries: {last_error}"
+            )
+        return ExtractionResult(
+            data={},
+            success=False,
+            retries=self.max_retries,
+            error=last_error,
+        )
 
     def _extract_initial(self, text: str) -> ExtractionResult:
         """Perform initial extraction attempt."""
@@ -239,19 +311,19 @@ class StructuredOutput:
         previous_result: ExtractionResult,
         attempt: int
     ) -> ExtractionResult:
-        """
-        Attempt to correct extraction based on previous failure.
+        """Attempt to correct extraction based on previous failure.
 
-        Uses progressive strategies:
+        Progressive strategies:
         - Attempt 0: Relaxed parsing
         - Attempt 1: Pattern-based extraction
         - Attempt 2+: Aggressive fallbacks
         """
+        # Pre-initialise so the except branch always has a defined binding
+        # (replaces the previous ``data if 'data' in dir() else {}`` introspection).
+        data: dict[str, Any] = {}
         try:
-            data: dict[str, Any] = {}
-
             for field_name, field_type in self.schema.items():
-                # Skip if already parsed correctly
+                # Skip if already parsed correctly.
                 if field_name in previous_result.data and previous_result.data[field_name] is not None:
                     try:
                         self._validate_field(previous_result.data[field_name], field_type)
@@ -260,11 +332,11 @@ class StructuredOutput:
                     except ValueError:
                         pass
 
-                # Try corrected parsing
+                # Try corrected parsing.
                 value = self._parse_field_corrected(text, field_name, field_type, attempt)
                 data[field_name] = value
 
-            # Validate all fields
+            # Validate all fields.
             for field_name, field_type in self.schema.items():
                 self._validate_field(data[field_name], field_type)
 
@@ -272,7 +344,7 @@ class StructuredOutput:
 
         except (ValueError, TypeError, KeyError, re.error):
             return ExtractionResult(
-                data=data if 'data' in dir() else {},
+                data=data,
                 success=False,
                 error="Correction failed"
             )
@@ -306,34 +378,43 @@ class StructuredOutput:
         return self._parsers.get(base_type, self._parse_string)
 
     def _parse_string(self, text: str, field_name: str, field_type: str) -> str:
-        """Extract string value."""
-        # Context-aware extraction based on field name
-        if field_name in ("name", "姓名", "名字"):
-            name_match = re.search(r'[一-龥]{2,4}(?=报|采|支|付|预|于)', text)
+        """Extract a string value (generic).
+
+        For the small set of field names in ``_CHINESE_NAME_FIELD_HINTS`` we
+        apply a documented domain-example heuristic that recognises the common
+        Chinese ``<name>报销|采购|支付|预|于`` reimbursement/purchase phrasing.
+        For all other field names we return the first non-whitespace token,
+        which is a deliberately weak default — use the LLM mode for robust
+        extraction.
+        """
+        # Domain-example heuristic (NOT part of the general contract).
+        if field_name in _CHINESE_NAME_FIELD_HINTS:
+            name_match = _CHINESE_NAME_CONTEXT_PATTERN.search(text)
             if name_match:
                 return name_match.group()
 
-        # Look for Chinese names (2-4 characters)
-        name_match = re.search(r'[一-龥]{2,4}(?=报|采|支|付|预)', text)
-        if name_match:
-            return name_match.group()
+        # Generic fallback: first non-whitespace token (works for both CJK
+        # runs and ASCII words).
+        match = re.search(r"\S+", text)
+        if match:
+            return match.group()
 
         raise ValueError(f"Cannot extract string for '{field_name}'")
 
     def _parse_number(self, text: str, field_name: str, field_type: str) -> float:
         """Extract numeric value."""
-        # Look for numbers with currency units
+        # Look for numbers with currency units.
         units_pattern = "|".join(CHINESE_CURRENCY_UNITS)
         match = re.search(rf'(\d+(?:\.\d+)?)\s*(?:{units_pattern})', text)
         if match:
             return float(match.group(1))
 
-        # Plain number
+        # Plain number.
         match = re.search(r'(\d+(?:\.\d+)?)', text)
         if match:
             return float(match.group(1))
 
-        # Chinese number words
+        # Chinese number words.
         for cn, num in CHINESE_NUMBERS.items():
             if cn in text:
                 return float(num)
@@ -371,31 +452,33 @@ class StructuredOutput:
 
         raise ValueError(f"Cannot match enum for '{field_name}'")
 
-    def _parse_array(self, text: str, field_name: str, field_type: str) -> list:
+    def _parse_array(self, text: str, field_name: str, field_type: str) -> list[Any]:
         """Extract array value."""
-        # Try JSON array first
+        # Try JSON array first.
         match = re.search(r'\[.*?\]', text)
         if match:
             try:
-                return json.loads(match.group())
+                parsed: Any = json.loads(match.group())
+                return list(parsed)
             except json.JSONDecodeError:
-                # JSON failed but brackets found - strip them and parse as CSV
+                # JSON failed but brackets found - strip them and parse as CSV.
                 bracket_content = match.group()
                 inner = bracket_content[1:-1]  # Remove [ and ]
                 items = re.split(r'[,，、]', inner)
                 return [item.strip() for item in items if item.strip()]
 
-        # No brackets - split by commas
+        # No brackets - split by commas.
         items = re.split(r'[,，、]', text)
         return [item.strip() for item in items if item.strip()]
 
-    def _parse_object(self, text: str, field_name: str, field_type: str) -> dict:
+    def _parse_object(self, text: str, field_name: str, field_type: str) -> dict[str, Any]:
         """Extract object value."""
         match = re.search(r'\{.*?\}', text)
         if match:
             try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
+                parsed_obj: Any = json.loads(match.group())
+                return dict(parsed_obj)
+            except (json.JSONDecodeError, ValueError):
                 pass
 
         return {}
@@ -403,6 +486,11 @@ class StructuredOutput:
     def _parse_relaxed(self, text: str, field_name: str, field_type: str) -> Any:
         """Parse with relaxed rules - still requires meaningful extraction."""
         if field_type == "string":
+            # Domain-example heuristic for the name field family.
+            if field_name in _CHINESE_NAME_FIELD_HINTS:
+                match = _CHINESE_NAME_CONTEXT_PATTERN.search(text)
+                if match:
+                    return match.group()
             match = re.search(r'[一-龥]+', text)
             if match:
                 return match.group()
@@ -459,6 +547,11 @@ class StructuredOutput:
     def _parse_aggressive(self, text: str, field_name: str, field_type: str) -> Any:
         """Aggressive fallback parsing - last meaningful attempt."""
         if field_type == "string":
+            # Domain-example heuristic for the name field family.
+            if field_name in _CHINESE_NAME_FIELD_HINTS:
+                match = _CHINESE_NAME_CONTEXT_PATTERN.search(text)
+                if match:
+                    return match.group()
             match = re.search(r'[一-龥]+|\w+', text)
             if match:
                 return match.group()
@@ -522,4 +615,4 @@ class StructuredOutput:
             if match:
                 valid_values = [v.strip() for v in match.group(1).split(",")]
                 if value not in valid_values:
-                    raise ValueError(f"Value not in valid enum values")
+                    raise ValueError("Value not in valid enum values")

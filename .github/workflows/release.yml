@@ -1,0 +1,60 @@
+name: Release
+
+# Publish to PyPI when a version tag (vX.Y.Z) is pushed.
+# Requires PYPI_API_TOKEN secret configured in the repo.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # for trusted publishing (preferred); falls back to token below
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build tools
+        run: |
+          pip install --upgrade pip
+          pip install build twine
+
+      - name: Verify clean tree matches tag
+        run: |
+          git describe --exact-match HEAD
+          echo "Releasing $(git describe --tags)"
+
+      - name: Lint and type-check before release
+        run: |
+          pip install -e ".[dev]"
+          ruff check vertai/
+          mypy --strict vertai/
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: twine check
+        run: twine check dist/*
+
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload --skip-existing dist/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*

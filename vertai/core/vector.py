@@ -1,49 +1,68 @@
-"""AI Agent SDK - 向量引擎模块
+"""Vector store abstraction (S3 refactor).
 
-支持本地向量存储和检索，优先使用 ChromaDB，备选 FAISS。
+Defines the :class:`VectorStore` ABC and three backends (``InMemory`` /
+``Chroma`` / ``FAISS``) plus the :class:`VectorEngine` facade. Embeddings are
+computed by an external :class:`~vertai.core.embedding.EmbeddingProvider` and
+passed into :meth:`VectorStore.add`; the store never embeds text itself. This
+separation fixes C2: when no provider is configured, :class:`VectorEngine`
+raises explicitly instead of silently producing hash-random vectors, and
+fixes C3: :meth:`FAISSVectorStore.delete` removes documents so ``count`` and
+``search`` stay consistent.
+
+The ``auto`` backend selection honors the documented priority
+``ChromaDB > FAISS > InMemory`` (previously FAISS was never selected).
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import random
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable, Optional, TYPE_CHECKING
+from typing import Any, Callable, Optional
 
-# numpy 是可选依赖，用于 FAISS 向量操作
-try:
-    import numpy as np
-    NUMPY_AVAILABLE = True
-except ImportError:
-    np = None  # type: ignore
-    NUMPY_AVAILABLE = False
-
-if TYPE_CHECKING:
-    pass
+from vertai.core.embedding import (
+    EmbeddingProvider,
+    FunctionEmbeddingProvider,
+)
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "Document",
+    "SearchResult",
+    "VectorConfig",
+    "VectorStore",
+    "InMemoryVectorStore",
+    "ChromaVectorStore",
+    "FAISSVectorStore",
+    "VectorEngine",
+    # Backward-compat alias (deprecated; prefer FunctionEmbeddingProvider).
+    "CustomEmbedding",
+]
 
 
 @dataclass
 class Document:
-    """文档数据结构"""
+    """Document stored in a :class:`VectorStore`.
+
+    ``doc_id`` defaults to an md5 prefix of ``content`` so identical content
+    deduplicates naturally.
+    """
 
     content: str
     metadata: dict[str, Any] = field(default_factory=dict)
     doc_id: str = ""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not self.doc_id:
             self.doc_id = hashlib.md5(self.content.encode()).hexdigest()[:12]
 
 
 @dataclass
 class SearchResult:
-    """检索结果"""
+    """A single retrieval result: the matched document plus similarity score."""
 
     document: Document
     score: float
@@ -52,9 +71,8 @@ class SearchResult:
 
 @dataclass
 class VectorConfig:
-    """向量引擎配置"""
+    """Configuration for :class:`VectorEngine` and its backends."""
 
-    embedding_model: str = "local"
     collection_name: str = "default"
     persist_directory: str | None = None
     chunk_size: int = 512
@@ -62,449 +80,368 @@ class VectorConfig:
     top_k: int = 5
 
 
-class EmbeddingEngine:
-    """嵌入向量引擎
-
-    支持本地模型和远程模型。
-    默认使用模拟嵌入，生产环境可替换为真实模型。
-    """
-
-    def __init__(self, model: str = "local", dimension: int = 384):
-        self.model = model
-        self.dimension = dimension
-
-    def embed(self, text: str) -> list[float]:
-        """生成文本嵌入向量
-
-        Args:
-            text: 输入文本
-
-        Returns:
-            嵌入向量
-        """
-        if self.model == "local":
-            return self._local_embed(text)
-        return self._local_embed(text)
-
-    def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """批量生成嵌入向量
-
-        Args:
-            texts: 文本列表
-
-        Returns:
-            嵌入向量列表
-        """
-        return [self.embed(text) for text in texts]
-
-    def _local_embed(self, text: str) -> list[float]:
-        """本地嵌入（模拟实现）
-
-        WARNING: 此方法仅用于测试和开发，不适用于生产环境。
-        随机种子基于文本哈希生成，相同文本产生相同向量，
-        但语义相似性不保证向量相似。
-
-        生产环境应替换为:
-        - sentence-transformers
-        - text-embedding-ada-002
-        - 本地 Ollama 模型
-        """
-        random.seed(hash(text) % (2**32))
-        vector = [random.gauss(0, 1) for _ in range(self.dimension)]
-        magnitude = sum(v * v for v in vector) ** 0.5
-        return [v / magnitude for v in vector]
-
-
-class CustomEmbedding:
-    """自定义嵌入函数包装器
-
-    用于接入云端 API（如 OpenAI Embeddings、DeepSeek 等）。
-
-    示例:
-        from vertai import LLMEngine, LLMConfig, ModelProvider
-
-        llm = LLMEngine(LLMConfig(
-            provider=ModelProvider.OPENAI,
-            api_key="sk-xxx",
-        ))
-
-        embedding = CustomEmbedding(llm.embeddings)
-        vector = embedding.embed("Hello World")
-    """
-
-    def __init__(self, embedding_fn: Callable[[str], list[float]]):
-        self._embedding_fn = embedding_fn
-
-    def embed(self, text: str) -> list[float]:
-        """生成嵌入向量"""
-        return self._embedding_fn(text)
-
-    def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """批量生成嵌入向量"""
-        return [self.embed(text) for text in texts]
+# Backward-compat alias. The old ``CustomEmbedding`` wrapped a callable; the new
+# abstraction is :class:`EmbeddingProvider` and :class:`FunctionEmbeddingProvider`
+# is the callable adapter. Kept so legacy imports keep resolving.
+CustomEmbedding = FunctionEmbeddingProvider
 
 
 class VectorStore(ABC):
-    """向量存储抽象基类"""
+    """Vector store abstraction. Stores documents + precomputed embeddings."""
 
     @abstractmethod
-    def add(self, documents: list[Document]) -> list[str]:
-        """添加文档
+    def add(
+        self, documents: list[Document], embeddings: list[list[float]]
+    ) -> None:
+        """Add ``documents`` with their precomputed ``embeddings``.
 
-        Args:
-            documents: 文档列表
-
-        Returns:
-            文档ID列表
+        Embeddings are computed externally by an
+        :class:`~vertai.core.embedding.EmbeddingProvider`; the store never
+        embeds text itself. The two lists must have equal length.
         """
-        pass
 
     @abstractmethod
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
-        """搜索相似文档
-
-        Args:
-            query: 查询文本
-            top_k: 返回数量
-
-        Returns:
-            搜索结果列表
-        """
-        pass
+    def search(
+        self, query_embedding: list[float], *, top_k: int = 5
+    ) -> list[SearchResult]:
+        """Search by a precomputed ``query_embedding`` vector."""
 
     @abstractmethod
-    def delete(self, doc_ids: list[str]) -> bool:
-        """删除文档
-
-        Args:
-            doc_ids: 文档ID列表
-
-        Returns:
-            是否成功
-        """
-        pass
+    def delete(self, ids: list[str]) -> None:
+        """Delete documents by id. Real deletion: ``count`` and ``search`` must
+        stay consistent afterwards (fixes C3)."""
 
     @abstractmethod
     def count(self) -> int:
-        """获取文档数量"""
-        pass
+        """Number of live documents."""
 
 
 class InMemoryVectorStore(VectorStore):
-    """内存向量存储
+    """In-memory vector store using cosine similarity.
 
-    简单实现，适合测试和小规模数据。
-    使用余弦相似度进行检索。
+    Suitable for tests and small datasets. No external dependencies.
     """
 
-    def __init__(self, embedding: EmbeddingEngine | None = None):
-        self.embedding = embedding or EmbeddingEngine()
+    def __init__(self) -> None:
         self._documents: dict[str, Document] = {}
         self._vectors: dict[str, list[float]] = {}
 
-    def add(self, documents: list[Document]) -> list[str]:
-        doc_ids = []
-        for doc in documents:
+    def add(
+        self, documents: list[Document], embeddings: list[list[float]]
+    ) -> None:
+        if len(documents) != len(embeddings):
+            raise ValueError(
+                "documents and embeddings must have the same length "
+                f"({len(documents)} vs {len(embeddings)})"
+            )
+        for doc, vec in zip(documents, embeddings):
             self._documents[doc.doc_id] = doc
-            self._vectors[doc.doc_id] = self.embedding.embed(doc.content)
-            doc_ids.append(doc.doc_id)
-        return doc_ids
+            self._vectors[doc.doc_id] = list(vec)
 
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+    def search(
+        self, query_embedding: list[float], *, top_k: int = 5
+    ) -> list[SearchResult]:
         if not self._documents:
             return []
-
-        query_vector = self.embedding.embed(query)
-        scores = []
-
+        scored: list[tuple[str, float, float]] = []
         for doc_id, doc in self._documents.items():
-            doc_vector = self._vectors[doc_id]
-            score = self._cosine_similarity(query_vector, doc_vector)
-            distance = 1 - score
-            scores.append((doc_id, score, distance))
-
-        scores.sort(key=lambda x: x[1], reverse=True)
-        results = []
-        for doc_id, score, distance in scores[:top_k]:
-            results.append(SearchResult(
+            score = self._cosine_similarity(query_embedding, self._vectors[doc_id])
+            scored.append((doc_id, score, 1.0 - score))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [
+            SearchResult(
                 document=self._documents[doc_id],
                 score=score,
                 distance=distance,
-            ))
-        return results
+            )
+            for doc_id, score, distance in scored[:top_k]
+        ]
 
-    def delete(self, doc_ids: list[str]) -> bool:
-        for doc_id in doc_ids:
+    def delete(self, ids: list[str]) -> None:
+        for doc_id in ids:
             self._documents.pop(doc_id, None)
             self._vectors.pop(doc_id, None)
-        return True
 
     def count(self) -> int:
         return len(self._documents)
 
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:
-        dot = sum(x * y for x, y in zip(a, b))
-        norm_a = sum(x * x for x in a) ** 0.5
-        norm_b = sum(x * x for x in b) ** 0.5
-        if norm_a == 0 or norm_b == 0:
+        dot = 0.0
+        norm_a_sq = 0.0
+        norm_b_sq = 0.0
+        for x, y in zip(a, b):
+            dot += x * y
+            norm_a_sq += x * x
+            norm_b_sq += y * y
+        if norm_a_sq == 0.0 or norm_b_sq == 0.0:
             return 0.0
-        return dot / (norm_a * norm_b)
+        return dot / (math.sqrt(norm_a_sq) * math.sqrt(norm_b_sq))
 
 
 class ChromaVectorStore(VectorStore):
-    """ChromaDB 向量存储
+    """ChromaDB-backed vector store. Supports persistence.
 
-    生产级本地向量数据库，支持持久化。
+    Requires the ``chromadb`` package. Embeddings are supplied to
+    :meth:`add` (the store does not embed text).
     """
 
     def __init__(
         self,
         collection_name: str = "default",
         persist_directory: str | None = None,
-        embedding: EmbeddingEngine | None = None,
-    ):
+    ) -> None:
         self.collection_name = collection_name
         self.persist_directory = persist_directory
-        self.embedding = embedding or EmbeddingEngine()
-        self._client = None
-        self._collection = None
+        self._client: Any = None
+        self._collection: Any = None
         self._initialized = False
 
     @staticmethod
     def is_available() -> bool:
-        """Check if ChromaDB is available."""
+        """Check whether ChromaDB is importable."""
         try:
             import chromadb  # noqa: F401
-            return True
         except ImportError:
             return False
+        return True
 
-    def _init_chroma(self):
+    def _init_chroma(self) -> None:
         if self._initialized:
             return
-
         try:
             import chromadb
-            from chromadb.config import Settings
-
-            if self.persist_directory:
-                self._client = chromadb.PersistentClient(
-                    path=self.persist_directory,
-                )
-            else:
-                self._client = chromadb.EphemeralClient()
-
-            self._collection = self._client.get_or_create_collection(
-                name=self.collection_name,
-            )
-            self._initialized = True
-            logger.info(f"ChromaDB initialized: {self.collection_name}")
-
-        except ImportError:
+        except ImportError as e:
             raise RuntimeError(
                 "ChromaDB not installed. Install with: pip install chromadb"
-            )
+            ) from e
 
-    def add(self, documents: list[Document]) -> list[str]:
+        if self.persist_directory:
+            self._client = chromadb.PersistentClient(path=self.persist_directory)
+        else:
+            self._client = chromadb.EphemeralClient()
+        self._collection = self._client.get_or_create_collection(
+            name=self.collection_name,
+        )
+        self._initialized = True
+        logger.info("ChromaDB initialized: %s", self.collection_name)
+
+    def add(
+        self, documents: list[Document], embeddings: list[list[float]]
+    ) -> None:
         self._init_chroma()
-
         if not documents:
-            return []
-
-        ids = [doc.doc_id for doc in documents]
-        contents = [doc.content for doc in documents]
-        metadatas = [doc.metadata for doc in documents]
-        embeddings = self.embedding.embed_batch(contents)
-
+            return
+        if len(documents) != len(embeddings):
+            raise ValueError(
+                "documents and embeddings must have the same length "
+                f"({len(documents)} vs {len(embeddings)})"
+            )
         self._collection.add(
-            ids=ids,
-            documents=contents,
-            metadatas=metadatas,
+            ids=[doc.doc_id for doc in documents],
+            documents=[doc.content for doc in documents],
+            metadatas=[doc.metadata for doc in documents],
             embeddings=embeddings,
         )
 
-        return ids
-
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+    def search(
+        self, query_embedding: list[float], *, top_k: int = 5
+    ) -> list[SearchResult]:
         self._init_chroma()
-
-        query_embedding = self.embedding.embed(query)
-
         results = self._collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
             include=["documents", "metadatas", "distances"],
         )
-
-        search_results = []
-        if results and results["ids"]:
-            for i, doc_id in enumerate(results["ids"][0]):
-                doc = Document(
-                    doc_id=doc_id,
-                    content=results["documents"][0][i],
-                    metadata=results["metadatas"][0][i] if results["metadatas"] else {},
+        search_results: list[SearchResult] = []
+        if results and results.get("ids"):
+            ids_row = results["ids"][0]
+            docs_row = results["documents"][0] if results.get("documents") else []
+            metas_row = (
+                results["metadatas"][0] if results.get("metadatas") else []
+            )
+            dists_row = (
+                results["distances"][0] if results.get("distances") else []
+            )
+            for i, doc_id in enumerate(ids_row):
+                content = docs_row[i] if i < len(docs_row) else ""
+                metadata = metas_row[i] if i < len(metas_row) else {}
+                distance = float(dists_row[i]) if i < len(dists_row) else 0.0
+                score = 1.0 / (1.0 + distance) if distance >= 0 else 0.0
+                search_results.append(
+                    SearchResult(
+                        document=Document(
+                            doc_id=doc_id, content=content, metadata=metadata
+                        ),
+                        score=score,
+                        distance=distance,
+                    )
                 )
-                distance = results["distances"][0][i] if results["distances"] else 0.0
-                score = 1 / (1 + distance)
-                search_results.append(SearchResult(
-                    document=doc,
-                    score=score,
-                    distance=distance,
-                ))
-
         return search_results
 
-    def delete(self, doc_ids: list[str]) -> bool:
+    def delete(self, ids: list[str]) -> None:
         self._init_chroma()
-
-        if not doc_ids:
-            return True
-
-        self._collection.delete(ids=doc_ids)
-        return True
+        if not ids:
+            return
+        self._collection.delete(ids=ids)
 
     def count(self) -> int:
         self._init_chroma()
-        return self._collection.count()
+        return int(self._collection.count())
 
 
 class FAISSVectorStore(VectorStore):
-    """FAISS 向量存储
+    """FAISS-backed vector store (``IndexFlatIP``, inner product on normalized
+    vectors).
 
-    Meta 开源的高效向量检索库，适合大规模数据。
+    Requires the ``faiss-cpu`` (or ``faiss-gpu``) and ``numpy`` packages.
+
+    FAISS ``IndexFlatIP`` does not support deletion; deleted documents are
+    removed from the live document map and filtered out of search results, and
+    :meth:`count` reports the live count (not ``index.ntotal``). This keeps
+    ``count`` and ``search`` consistent after deletion (fixes C3). Stale vectors
+    remain in the index and are compacted only by rebuilding — acceptable for
+    1.0; a ``compact`` method can arrive in 1.x.
     """
 
-    def __init__(
-        self,
-        embedding: EmbeddingEngine | None = None,
-        dimension: int = 384,
-    ):
-        self.embedding = embedding or EmbeddingEngine(dimension=dimension)
+    def __init__(self, dimension: int = 384) -> None:
         self.dimension = dimension
-        self._index = None
+        self._index: Any = None
         self._documents: dict[int, Document] = {}
+        self._id_to_idx: dict[str, int] = {}
         self._id_counter = 0
         self._initialized = False
-        self._np = None
+        self._np: Any = None
 
-    def _init_faiss(self):
-        if self._initialized:
-            return
-
+    @staticmethod
+    def is_available() -> bool:
+        """Check whether both ``faiss`` and ``numpy`` are importable."""
         try:
-            import faiss
-
-            self._index = faiss.IndexFlatIP(self.dimension)
-            self._np = np
-            self._initialized = True
-            logger.info(f"FAISS initialized with dimension {self.dimension}")
-
+            import faiss  # noqa: F401
+            import numpy  # noqa: F401
         except ImportError:
-            raise RuntimeError(
-                "FAISS not installed. Install with: pip install faiss-cpu"
-            )
-
-    def add(self, documents: list[Document]) -> list[str]:
-        self._init_faiss()
-
-        doc_ids = []
-        vectors = []
-
-        for doc in documents:
-            vector = self.embedding.embed(doc.content)
-            vectors.append(vector)
-
-            idx = self._id_counter
-            self._documents[idx] = doc
-            doc_ids.append(doc.doc_id)
-            self._id_counter += 1
-
-        vectors_np = self._np.array(vectors, dtype=self._np.float32)
-        self._index.add(vectors_np)
-
-        return doc_ids
-
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
-        self._init_faiss()
-
-        if self._index.ntotal == 0:
-            return []
-
-        query_vector = self._np.array(
-            [self.embedding.embed(query)],
-            dtype=self._np.float32,
-        )
-
-        scores, indices = self._index.search(query_vector, min(top_k, self._index.ntotal))
-
-        results = []
-        for i, idx in enumerate(indices[0]):
-            if idx < len(self._documents):
-                doc = self._documents[idx]
-                score = float(scores[0][i])
-                distance = 1 - score
-                results.append(SearchResult(
-                    document=doc,
-                    score=score,
-                    distance=distance,
-                ))
-
-        return results
-
-    def delete(self, doc_ids: list[str]) -> bool:
-        idxs_to_remove = [
-            idx for idx, doc in self._documents.items()
-            if doc.doc_id in doc_ids
-        ]
-        for idx in idxs_to_remove:
-            del self._documents[idx]
+            return False
         return True
 
+    def _init_faiss(self) -> None:
+        if self._initialized:
+            return
+        try:
+            import faiss
+            import numpy as _np
+        except ImportError as e:
+            raise RuntimeError(
+                "FAISS not installed. Install with: pip install faiss-cpu"
+            ) from e
+        self._np = _np
+        self._index = faiss.IndexFlatIP(self.dimension)
+        self._initialized = True
+        logger.info("FAISS initialized with dimension %d", self.dimension)
+
+    def add(
+        self, documents: list[Document], embeddings: list[list[float]]
+    ) -> None:
+        self._init_faiss()
+        if not documents:
+            return
+        if len(documents) != len(embeddings):
+            raise ValueError(
+                "documents and embeddings must have the same length "
+                f"({len(documents)} vs {len(embeddings)})"
+            )
+        if not embeddings:
+            return
+        dim = len(embeddings[0])
+        if dim != self.dimension:
+            raise ValueError(
+                f"embedding dimension {dim} does not match store dimension "
+                f"{self.dimension}"
+            )
+        vectors = self._np.array(embeddings, dtype=self._np.float32)
+        self._index.add(vectors)
+        for doc in documents:
+            idx = self._id_counter
+            self._documents[idx] = doc
+            self._id_to_idx[doc.doc_id] = idx
+            self._id_counter += 1
+
+    def search(
+        self, query_embedding: list[float], *, top_k: int = 5
+    ) -> list[SearchResult]:
+        self._init_faiss()
+        if not self._documents:
+            return []
+        query_vector = self._np.array([query_embedding], dtype=self._np.float32)
+        k = min(top_k, len(self._documents))
+        scores, indices = self._index.search(query_vector, k)
+        results: list[SearchResult] = []
+        scores_row = scores[0]
+        indices_row = indices[0]
+        for i, idx in enumerate(indices_row):
+            idx_int = int(idx)
+            # C3 fix: filter out deleted / stale indices.
+            if idx_int in self._documents:
+                doc = self._documents[idx_int]
+                score = float(scores_row[i])
+                results.append(
+                    SearchResult(
+                        document=doc, score=score, distance=1.0 - score
+                    )
+                )
+        return results
+
+    def delete(self, ids: list[str]) -> None:
+        for doc_id in ids:
+            idx = self._id_to_idx.pop(doc_id, None)
+            if idx is not None:
+                self._documents.pop(idx, None)
+        # NOTE: stale vectors remain in the FAISS index but are filtered out of
+        # search results above; count() reports only live documents.
+
     def count(self) -> int:
-        return self._index.ntotal if self._initialized else 0
+        # C3 fix: live documents, not index.ntotal (which still counts deleted).
+        return len(self._documents)
 
 
 class VectorEngine:
-    """向量引擎
+    """Facade composing an :class:`EmbeddingProvider` and a :class:`VectorStore`.
 
-    统一的向量存储接口，自动选择最佳后端。
-    优先级: ChromaDB > FAISS > InMemory
+    Selects a backend by ``store_type`` (``memory`` / ``chroma`` / ``faiss`` /
+    ``auto``). ``auto`` honors the documented priority ChromaDB > FAISS >
+    InMemory (previously FAISS was never selected).
 
-    支持自定义嵌入函数，可接入云端 API：
+    C2 fix: there is no hash-random fallback. If no embedding provider is
+    configured, :meth:`index_documents` and :meth:`search` raise explicitly
+    rather than silently producing non-semantic vectors. Construct the engine
+    freely (e.g. ``VectorEngine(store_type="memory")``) and inject a provider
+    via ``embedding_provider=`` (preferred) or the legacy ``embedding_fn=``
+    (wrapped in :class:`FunctionEmbeddingProvider`).
 
-    示例:
-        # 使用云端嵌入 API
-        from vertai import LLMEngine, LLMConfig, ModelProvider
+    Example:
+        from vertai.core.embedding import LocalSentenceTransformerProvider
+        from vertai.core.vector import VectorEngine, Document
 
-        llm = LLMEngine(LLMConfig(
-            provider=ModelProvider.OPENAI,
-            base_url="https://api.openai.com/v1",
-            api_key="sk-xxx",
-        ))
-
-        # 方式1: 传入嵌入函数
-        engine = VectorEngine(embedding_fn=llm.embeddings)
-
-        # 方式2: 使用本地模拟（默认，仅测试用）
-        engine = VectorEngine(store_type="memory")
+        provider = LocalSentenceTransformerProvider()
+        engine = VectorEngine(embedding_provider=provider, store_type="memory")
+        engine.index_documents([Document(content="...")])
+        results = engine.search("query")
     """
 
     def __init__(
         self,
         config: VectorConfig | None = None,
         store_type: str = "auto",
+        embedding_provider: EmbeddingProvider | None = None,
         embedding_fn: Optional[Callable[[str], list[float]]] = None,
-    ):
+    ) -> None:
         self.config = config or VectorConfig()
-
-        # 支持自定义嵌入函数（如云端 API）
-        if embedding_fn is not None:
-            self.embedding = CustomEmbedding(embedding_fn)
+        if embedding_provider is not None:
+            self._embedding: EmbeddingProvider | None = embedding_provider
+        elif embedding_fn is not None:
+            self._embedding = FunctionEmbeddingProvider(embedding_fn)
         else:
-            # 默认使用本地模拟嵌入（仅测试用）
-            self.embedding = EmbeddingEngine(model=self.config.embedding_model)
-
+            # No default hash-random provider (C2 fix).
+            self._embedding = None
         self._store: VectorStore | None = None
         self._store_type = store_type
 
@@ -514,11 +451,28 @@ class VectorEngine:
             self._store = self._create_store()
         return self._store
 
-    def _create_store(self) -> VectorStore:
-        if self._store_type == "memory":
-            return InMemoryVectorStore(embedding=self.embedding)
+    @property
+    def embedding(self) -> EmbeddingProvider | None:
+        """The configured embedding provider, or ``None`` if none set."""
+        return self._embedding
 
-        if self._store_type == "chroma":
+    def get_embedding(self) -> EmbeddingProvider:
+        """Return the embedding provider or raise (C2 fix: no silent random)."""
+        if self._embedding is None:
+            raise RuntimeError(
+                "No EmbeddingProvider configured. VectorEngine no longer falls "
+                "back to random vectors (they produced non-semantic results). "
+                "Inject one via VectorEngine(embedding_provider=...) or "
+                "embedding_fn=..., or install 'vertai[embeddings]' and use "
+                "LocalSentenceTransformerProvider."
+            )
+        return self._embedding
+
+    def _create_store(self) -> VectorStore:
+        store_type = self._store_type
+        if store_type == "memory":
+            return InMemoryVectorStore()
+        if store_type == "chroma":
             if not ChromaVectorStore.is_available():
                 raise RuntimeError(
                     "ChromaDB not installed. Install with: pip install chromadb"
@@ -526,60 +480,55 @@ class VectorEngine:
             return ChromaVectorStore(
                 collection_name=self.config.collection_name,
                 persist_directory=self.config.persist_directory,
-                embedding=self.embedding,
             )
+        if store_type == "faiss":
+            if not FAISSVectorStore.is_available():
+                raise RuntimeError(
+                    "FAISS not installed. Install with: pip install faiss-cpu"
+                )
+            return FAISSVectorStore(dimension=self._infer_dimension())
 
-        if self._store_type == "faiss":
-            return FAISSVectorStore(embedding=self.embedding)
-
-        # auto: try ChromaDB first, fallback to memory
+        # auto: ChromaDB > FAISS > InMemory (honest priority).
         if ChromaVectorStore.is_available():
-            logger.info("Using ChromaDB as vector store")
+            logger.info("auto: using ChromaDB as vector store")
             return ChromaVectorStore(
                 collection_name=self.config.collection_name,
                 persist_directory=self.config.persist_directory,
-                embedding=self.embedding,
             )
-        else:
-            logger.info("ChromaDB unavailable, using in-memory store")
-            return InMemoryVectorStore(embedding=self.embedding)
+        if FAISSVectorStore.is_available():
+            logger.info("auto: using FAISS as vector store")
+            return FAISSVectorStore(dimension=self._infer_dimension())
+        logger.info("auto: using in-memory vector store")
+        return InMemoryVectorStore()
+
+    def _infer_dimension(self) -> int:
+        if self._embedding is not None:
+            return self._embedding.dimension
+        return 384
 
     def index_documents(self, documents: list[Document]) -> list[str]:
-        """索引文档
+        """Embed (via the provider) and store ``documents``. Returns their ids."""
+        if not documents:
+            return []
+        provider = self.get_embedding()
+        embeddings = provider.embed([doc.content for doc in documents])
+        self.store.add(documents, embeddings)
+        return [doc.doc_id for doc in documents]
 
-        Args:
-            documents: 文档列表
+    def search(
+        self, query: str, top_k: int | None = None
+    ) -> list[SearchResult]:
+        """Embed ``query`` and search the store."""
+        provider = self.get_embedding()
+        query_vector = provider.embed(query)[0]
+        return self.store.search(query_vector, top_k=top_k or self.config.top_k)
 
-        Returns:
-            文档ID列表
-        """
-        return self.store.add(documents)
-
-    def search(self, query: str, top_k: int | None = None) -> list[SearchResult]:
-        """搜索相似文档
-
-        Args:
-            query: 查询文本
-            top_k: 返回数量
-
-        Returns:
-            搜索结果列表
-        """
-        return self.store.search(query, top_k or self.config.top_k)
-
-    def delete_documents(self, doc_ids: list[str]) -> bool:
-        """删除文档
-
-        Args:
-            doc_ids: 文档ID列表
-
-        Returns:
-            是否成功
-        """
-        return self.store.delete(doc_ids)
+    def delete_documents(self, ids: list[str]) -> None:
+        """Delete documents by id."""
+        self.store.delete(ids)
 
     def count(self) -> int:
-        """获取文档数量"""
+        """Live document count."""
         return self.store.count()
 
     def hybrid_search(
@@ -589,26 +538,18 @@ class VectorEngine:
         top_k: int | None = None,
         alpha: float = 0.7,
     ) -> list[SearchResult]:
-        """混合检索（向量 + 关键词）
+        """Hybrid retrieval: vector similarity + keyword overlap fusion.
 
-        Args:
-            query: 查询文本
-            keywords: 关键词列表
-            top_k: 返回数量
-            alpha: 向量检索权重 (0-1)
-
-        Returns:
-            混合排序结果
+        ``alpha`` is the vector-score weight (``1 - alpha`` is the keyword
+        weight). Without ``keywords`` this degenerates to plain vector search.
         """
         top_k = top_k or self.config.top_k
         vector_results = self.search(query, top_k=top_k * 2)
-
         if not keywords:
             return vector_results[:top_k]
-
-        scored_results = self._compute_keyword_scores(vector_results, keywords, alpha)
-        scored_results.sort(key=lambda x: x.score, reverse=True)
-        return scored_results[:top_k]
+        scored = self._compute_keyword_scores(vector_results, keywords, alpha)
+        scored.sort(key=lambda x: x.score, reverse=True)
+        return scored[:top_k]
 
     def _compute_keyword_scores(
         self,
@@ -616,30 +557,19 @@ class VectorEngine:
         keywords: list[str],
         alpha: float,
     ) -> list[SearchResult]:
-        """计算关键词匹配分数并融合向量分数
-
-        Args:
-            results: 向量检索结果
-            keywords: 关键词列表
-            alpha: 向量分数权重
-
-        Returns:
-            融合分数后的结果列表
-        """
-        scored_results = []
         keywords_lower = [kw.lower() for kw in keywords]
-
+        scored: list[SearchResult] = []
         for result in results:
             content_lower = result.document.content.lower()
             keyword_score = sum(
                 1 for kw in keywords_lower if kw in content_lower
             ) / len(keywords)
-
-            final_score = alpha * result.score + (1 - alpha) * keyword_score
-            scored_results.append(SearchResult(
-                document=result.document,
-                score=final_score,
-                distance=result.distance,
-            ))
-
-        return scored_results
+            final_score = alpha * result.score + (1.0 - alpha) * keyword_score
+            scored.append(
+                SearchResult(
+                    document=result.document,
+                    score=final_score,
+                    distance=result.distance,
+                )
+            )
+        return scored

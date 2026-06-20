@@ -2,7 +2,6 @@
 
 import json
 import pytest
-from datetime import datetime
 
 from vertai.viz.dashboard import (
     Chart,

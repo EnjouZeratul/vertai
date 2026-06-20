@@ -1,10 +1,17 @@
 """Document parser module supporting multiple file formats."""
 
-import json
+from __future__ import annotations
+
 import re
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Type-only imports for the optional doc-parser extras. The actual
+    # imports happen lazily inside ``parse()`` methods guarded by try/except.
+    from docx.table import Table as _DocxTable
+    from openpyxl.worksheet.worksheet import Worksheet as _OpenpyxlWorksheet
 
 
 class BaseParser(ABC):
@@ -140,7 +147,7 @@ class WordParser(BaseParser):
             chunks=chunks,
         )
 
-    def _extract_table(self, table) -> str:
+    def _extract_table(self, table: "_DocxTable") -> str:
         """Extract table content as text."""
         rows = []
         for row in table.rows:
@@ -189,7 +196,7 @@ class ExcelParser(BaseParser):
             chunks=chunks,
         )
 
-    def _extract_sheet(self, worksheet) -> str:
+    def _extract_sheet(self, worksheet: "_OpenpyxlWorksheet") -> str:
         """Extract worksheet content as text."""
         rows = []
         for row in worksheet.iter_rows(values_only=True):
@@ -241,7 +248,7 @@ class PPTParser(BaseParser):
             chunks=chunks,
         )
 
-    def _extract_slide(self, slide) -> str:
+    def _extract_slide(self, slide: Any) -> str:
         """Extract slide content as text."""
         shapes_text = []
         for shape in slide.shapes:
@@ -285,7 +292,7 @@ class MarkdownParser(BaseParser):
         """Create chunks based on markdown sections."""
         chunks = []
         lines = content.split("\n")
-        current_chunk = []
+        current_chunk: list[str] = []
         current_header = "Introduction"
 
         for line in lines:
@@ -337,7 +344,7 @@ class DocParser:
         ".markdown": MarkdownParser,
     }
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._parsers: dict[str, BaseParser] = {}
 
     def _get_parser(self, extension: str) -> BaseParser:

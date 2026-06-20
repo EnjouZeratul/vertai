@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Union
+from typing import Union
 import html
 import json
 
@@ -155,12 +155,16 @@ class Dashboard:
     """Dashboard for visualizing metrics and charts with HTML export.
 
     Examples:
-        >>> from vertai import Dashboard
+        >>> from vertai.viz.dashboard import Dashboard
         >>> dash = Dashboard(title="Performance Dashboard")
         >>> dash.add_metric("任务完成率", 85, unit="%")
         >>> dash.add_chart("趋势", [10, 20, 30, 40], chart_type="line")
         >>> dash.show()  # Display dashboard
         >>> dash.export("report.html")  # Export to HTML file
+
+    Note:
+        Dashboard lives in the optional ``vertai[viz]`` extra and is not
+        imported by ``import vertai``. Install/use the explicit path above.
     """
 
     def __init__(
@@ -387,7 +391,7 @@ class Dashboard:
             "</style>",
             "</head>",
             f"<body style='background-color: {bg_color}; color: {text_color};'>",
-            f"<div class='container'>",
+            "<div class='container'>",
             f"<h1 class='dashboard-title'>{html.escape(self._title)}</h1>",
             f"<p class='timestamp'>生成时间: {self._created_at.strftime('%Y-%m-%d %H:%M:%S')}</p>",
         ]

@@ -1,25 +1,29 @@
-"""本地模型管理
+"""Local model management.
 
-支持本地化小模型的下载、管理和调用。
+Download, cache and load small local models (Whisper speech-to-text and
+sentence-transformers embeddings). No cloud API is required.
 
-支持的模型类型：
-1. 语音转文字 (Whisper) - 需要至少 2GB 内存
-2. 向量嵌入模型 (sentence-transformers) - 需要至少 1GB 内存
-3. 图像识别模型 - 需要至少 4GB 内存
+Supported model types:
+  1. Speech-to-text (Whisper) - needs >= 1GB RAM.
+  2. Sentence embedding (sentence-transformers) - needs >= 0.5GB RAM.
 
-网络需求：
-- Whisper: 首次下载约 150MB-1.5GB (取决于模型大小)
-- sentence-transformers: 首次下载约 100MB-500MB
-- 图像模型: 首次下载约 300MB-2GB
+Network: the first load of a model downloads weights through the underlying
+library (``openai-whisper`` / ``sentence-transformers``), which reads weights
+from Hugging Face / OpenAI's public blob storage. The ``download_url`` field on
+each :class:`NetworkRequirements` is informational metadata (the canonical
+source of the weights); it is not used to fetch bytes directly.
+
+Mirror support: when ``use_mirror`` is enabled and a mirror is configured, the
+selected mirror endpoint is exported via the ``HF_ENDPOINT`` environment
+variable, which ``huggingface_hub`` and ``sentence-transformers`` read at
+download time. This is the documented way to redirect Hugging Face downloads
+(e.g. to ``https://hf-mirror.com`` for users behind the GFW).
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
-import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -27,12 +31,15 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# 默认模型缓存目录
+# Default model cache directory. The directory is created lazily on first
+# download, never at construction time (the constructor must be side-effect
+# free so that merely inspecting model metadata does not touch the filesystem).
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "vertai" / "models"
 
 
 class ModelCategory(Enum):
-    """模型类别"""
+    """Model category."""
+
     SPEECH_TO_TEXT = "speech_to_text"
     EMBEDDING = "embedding"
     IMAGE = "image"
@@ -41,7 +48,8 @@ class ModelCategory(Enum):
 
 @dataclass
 class HardwareRequirements:
-    """硬件需求"""
+    """Hardware requirements for a model."""
+
     min_ram_gb: float
     recommended_ram_gb: float
     min_gpu_vram_gb: Optional[float] = None
@@ -60,11 +68,20 @@ class HardwareRequirements:
 
 @dataclass
 class NetworkRequirements:
-    """网络需求"""
+    """Network requirements for downloading a model.
+
+    ``download_url`` is informational metadata pointing at the canonical source
+    of the weights (Hugging Face model repo or OpenAI's public mirror). The
+    actual bytes are fetched by the underlying library (``openai-whisper`` /
+    ``sentence-transformers``) using their own resolution logic; this URL is not
+    used to fetch bytes directly. Mirrors are applied by exporting
+    ``HF_ENDPOINT`` for ``huggingface_hub``-based downloads.
+    """
+
     download_size_mb: float
     download_url: str
     mirrors: list[str] = field(default_factory=list)
-    estimated_download_time_minutes: Optional[float] = None  # 基于 10Mbps
+    estimated_download_time_minutes: Optional[float] = None  # at ~10Mbps
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -76,8 +93,14 @@ class NetworkRequirements:
 
 
 @dataclass
-class ModelInfo:
-    """模型信息"""
+class LocalModelInfo:
+    """Metadata for a locally-downloadable model.
+
+    Renamed from ``ModelInfo`` (kept in :mod:`vertai.local` as a deprecated
+    alias) to distinguish it from :class:`vertai.core.llm.LLMModelInfo` which
+    describes cloud LLM models.
+    """
+
     name: str
     category: ModelCategory
     description: str
@@ -102,13 +125,22 @@ class ModelInfo:
         }
 
 
-# 预定义的模型信息
-AVAILABLE_MODELS: dict[str, ModelInfo] = {
-    # Whisper 语音转文字模型
-    "whisper-tiny": ModelInfo(
+# Backwards-compatible alias. New code should use :class:`LocalModelInfo` to
+# avoid any confusion with :class:`vertai.core.llm.LLMModelInfo`.
+ModelInfo = LocalModelInfo
+
+
+# Predefined model metadata.
+#
+# ``download_url`` values point at the canonical public source of the weights
+# (informational). They are NOT used by this module to fetch bytes; the
+# underlying library performs the download.
+AVAILABLE_MODELS: dict[str, LocalModelInfo] = {
+    # --- Whisper speech-to-text models ---
+    "whisper-tiny": LocalModelInfo(
         name="whisper-tiny",
         category=ModelCategory.SPEECH_TO_TEXT,
-        description="OpenAI Whisper 微型模型，快速但精度较低",
+        description="OpenAI Whisper tiny model. Fast, lower accuracy.",
         version="20231117",
         hardware=HardwareRequirements(
             min_ram_gb=1.0,
@@ -117,17 +149,17 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         ),
         network=NetworkRequirements(
             download_size_mb=75,
-            download_url="https://openaipublic.azureedge.net/whisper/models/65147644a518d12f04e7d6098a2b6a45a7c2e0e0",
+            download_url="https://huggingface.co/openai/whisper-tiny",
             estimated_download_time_minutes=1,
         ),
         languages=["zh", "en", "ja", "ko", "es", "fr", "de", "ru", "auto"],
         tags=["speech", "transcription", "fast", "cpu-friendly"],
         license="MIT",
     ),
-    "whisper-base": ModelInfo(
+    "whisper-base": LocalModelInfo(
         name="whisper-base",
         category=ModelCategory.SPEECH_TO_TEXT,
-        description="OpenAI Whisper 基础模型，平衡速度和精度",
+        description="OpenAI Whisper base model. Balanced speed and accuracy.",
         version="20231117",
         hardware=HardwareRequirements(
             min_ram_gb=1.5,
@@ -136,17 +168,17 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         ),
         network=NetworkRequirements(
             download_size_mb=142,
-            download_url="https://openaipublic.azureedge.net/whisper/models/ed3d97b362a9530e7b8d29b1d1e1e1e1e1e1e1e1",
+            download_url="https://huggingface.co/openai/whisper-base",
             estimated_download_time_minutes=2,
         ),
         languages=["zh", "en", "ja", "ko", "es", "fr", "de", "ru", "auto"],
         tags=["speech", "transcription", "balanced"],
         license="MIT",
     ),
-    "whisper-small": ModelInfo(
+    "whisper-small": LocalModelInfo(
         name="whisper-small",
         category=ModelCategory.SPEECH_TO_TEXT,
-        description="OpenAI Whisper 小型模型，较高精度",
+        description="OpenAI Whisper small model. Higher accuracy.",
         version="20231117",
         hardware=HardwareRequirements(
             min_ram_gb=2.0,
@@ -157,17 +189,17 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         ),
         network=NetworkRequirements(
             download_size_mb=466,
-            download_url="https://openaipublic.azureedge.net/whisper/models/ed3d97b362a9530e7b8d29b1d1e1e1e1e1e1e1e",
+            download_url="https://huggingface.co/openai/whisper-small",
             estimated_download_time_minutes=8,
         ),
         languages=["zh", "en", "ja", "ko", "es", "fr", "de", "ru", "auto"],
         tags=["speech", "transcription", "accurate"],
         license="MIT",
     ),
-    "whisper-medium": ModelInfo(
+    "whisper-medium": LocalModelInfo(
         name="whisper-medium",
         category=ModelCategory.SPEECH_TO_TEXT,
-        description="OpenAI Whisper 中型模型，高精度",
+        description="OpenAI Whisper medium model. High accuracy.",
         version="20231117",
         hardware=HardwareRequirements(
             min_ram_gb=5.0,
@@ -178,17 +210,17 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         ),
         network=NetworkRequirements(
             download_size_mb=1500,
-            download_url="https://openaipublic.azureedge.net/whisper/models/ed3d97b362a9530e7b8d29b1d1e1e1e1e1e1e1e",
+            download_url="https://huggingface.co/openai/whisper-medium",
             estimated_download_time_minutes=25,
         ),
         languages=["zh", "en", "ja", "ko", "es", "fr", "de", "ru", "auto"],
         tags=["speech", "transcription", "high-accuracy"],
         license="MIT",
     ),
-    "whisper-large-v3": ModelInfo(
+    "whisper-large-v3": LocalModelInfo(
         name="whisper-large-v3",
         category=ModelCategory.SPEECH_TO_TEXT,
-        description="OpenAI Whisper 大型模型 v3，最高精度",
+        description="OpenAI Whisper large-v3 model. Best accuracy.",
         version="20231117",
         hardware=HardwareRequirements(
             min_ram_gb=10.0,
@@ -199,7 +231,7 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         ),
         network=NetworkRequirements(
             download_size_mb=2900,
-            download_url="https://openaipublic.azureedge.net/whisper/models/ed3d97b362a9530e7b8d29b1d1e1e1e1e1e1e1e",
+            download_url="https://huggingface.co/openai/whisper-large-v3",
             estimated_download_time_minutes=48,
         ),
         languages=["zh", "en", "ja", "ko", "es", "fr", "de", "ru", "auto"],
@@ -207,11 +239,11 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         license="MIT",
     ),
 
-    # 向量嵌入模型
-    "all-MiniLM-L6-v2": ModelInfo(
+    # --- Sentence embedding models ---
+    "all-MiniLM-L6-v2": LocalModelInfo(
         name="all-MiniLM-L6-v2",
         category=ModelCategory.EMBEDDING,
-        description="轻量级句子嵌入模型，适合通用语义搜索",
+        description="Lightweight sentence embedding model for general semantic search.",
         version="1.0",
         hardware=HardwareRequirements(
             min_ram_gb=0.5,
@@ -228,10 +260,10 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         tags=["embedding", "semantic-search", "lightweight", "cpu-friendly"],
         license="Apache-2.0",
     ),
-    "paraphrase-multilingual-MiniLM-L12-v2": ModelInfo(
+    "paraphrase-multilingual-MiniLM-L12-v2": LocalModelInfo(
         name="paraphrase-multilingual-MiniLM-L12-v2",
         category=ModelCategory.EMBEDDING,
-        description="多语言句子嵌入模型，支持中文",
+        description="Multilingual sentence embedding model with Chinese support.",
         version="1.0",
         hardware=HardwareRequirements(
             min_ram_gb=1.0,
@@ -240,18 +272,24 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         ),
         network=NetworkRequirements(
             download_size_mb=420,
-            download_url="https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-            mirrors=["https://hf-mirror.com/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"],
+            download_url=(
+                "https://huggingface.co/"
+                "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+            ),
+            mirrors=[
+                "https://hf-mirror.com/"
+                "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+            ],
             estimated_download_time_minutes=7,
         ),
         languages=["zh", "en", "es", "fr", "de", "it", "nl", "pt", "pl", "ru"],
         tags=["embedding", "semantic-search", "multilingual", "chinese"],
         license="Apache-2.0",
     ),
-    "text-embedding-3-small": ModelInfo(
+    "text-embedding-3-small": LocalModelInfo(
         name="text-embedding-3-small",
         category=ModelCategory.EMBEDDING,
-        description="中文优化的嵌入模型",
+        description="Chinese-optimized embedding model (text2vec-base-chinese).",
         version="1.0",
         hardware=HardwareRequirements(
             min_ram_gb=1.0,
@@ -268,10 +306,10 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         tags=["embedding", "chinese", "semantic-search"],
         license="Apache-2.0",
     ),
-    "bge-small-zh-v1.5": ModelInfo(
+    "bge-small-zh-v1.5": LocalModelInfo(
         name="bge-small-zh-v1.5",
         category=ModelCategory.EMBEDDING,
-        description="BGE 中文小型嵌入模型，高性能",
+        description="BGE Chinese small embedding model. High performance.",
         version="1.5",
         hardware=HardwareRequirements(
             min_ram_gb=0.5,
@@ -288,10 +326,10 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         tags=["embedding", "chinese", "bge", "high-performance"],
         license="Apache-2.0",
     ),
-    "bge-large-zh-v1.5": ModelInfo(
+    "bge-large-zh-v1.5": LocalModelInfo(
         name="bge-large-zh-v1.5",
         category=ModelCategory.EMBEDDING,
-        description="BGE 中文大型嵌入模型，最高性能",
+        description="BGE Chinese large embedding model. Best performance.",
         version="1.5",
         hardware=HardwareRequirements(
             min_ram_gb=2.0,
@@ -315,58 +353,60 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
 
 @dataclass
 class LocalModelConfig:
-    """本地模型配置"""
+    """Local model manager configuration."""
+
     model_name: str
     cache_dir: Optional[str] = None
     device: str = "auto"  # auto, cpu, cuda, mps
-    download_timeout: int = 3600  # 秒
-    use_mirror: bool = True  # 使用国内镜像
+    download_timeout: int = 3600  # seconds
+    use_mirror: bool = True  # export HF_ENDPOINT for the configured mirror
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.cache_dir is None:
             self.cache_dir = str(DEFAULT_CACHE_DIR)
 
 
 class LocalModelManager:
-    """本地模型管理器
+    """Local model manager.
 
-    管理本地模型的下载、加载和调用。
+    Downloads, loads, caches and unloads local models. The cache directory is
+    created lazily on first download; the constructor performs no filesystem
+    I/O so merely instantiating the manager (e.g. to inspect metadata) is
+    side-effect free.
 
-    示例:
+    Example:
         >>> manager = LocalModelManager()
-        >>>
-        >>> # 列出可用模型
         >>> manager.list_models(ModelCategory.SPEECH_TO_TEXT)
-        >>>
-        >>> # 下载模型
         >>> manager.download("whisper-small")
-        >>>
-        >>> # 加载模型
         >>> model = manager.load("whisper-small")
         >>> result = model.transcribe("audio.mp3")
     """
 
-    def __init__(self, config: Optional[LocalModelConfig] = None):
+    def __init__(self, config: Optional[LocalModelConfig] = None) -> None:
         self.config = config or LocalModelConfig(model_name="")
         self._loaded_models: dict[str, Any] = {}
-        self._cache_dir = Path(self.config.cache_dir) if self.config else DEFAULT_CACHE_DIR
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._cache_dir = (
+            Path(self.config.cache_dir)
+            if self.config.cache_dir is not None
+            else DEFAULT_CACHE_DIR
+        )
+        # NOTE: deliberately no mkdir here — construction is side-effect free.
 
     def list_models(
         self,
         category: Optional[ModelCategory] = None,
         language: Optional[str] = None,
         tag: Optional[str] = None,
-    ) -> list[ModelInfo]:
-        """列出可用模型
+    ) -> list[LocalModelInfo]:
+        """List available models, optionally filtered.
 
         Args:
-            category: 按类别过滤
-            language: 按支持语言过滤
-            tag: 按标签过滤
+            category: Filter by model category.
+            language: Filter by supported language.
+            tag: Filter by tag.
 
         Returns:
-            模型信息列表
+            List of matching model metadata.
         """
         models = list(AVAILABLE_MODELS.values())
 
@@ -381,12 +421,12 @@ class LocalModelManager:
 
         return models
 
-    def get_model_info(self, model_name: str) -> Optional[ModelInfo]:
-        """获取模型信息"""
+    def get_model_info(self, model_name: str) -> Optional[LocalModelInfo]:
+        """Get metadata for a named model, or ``None`` if unknown."""
         return AVAILABLE_MODELS.get(model_name)
 
     def is_downloaded(self, model_name: str) -> bool:
-        """检查模型是否已下载"""
+        """Return True if a model appears to be present in the cache."""
         model_info = self.get_model_info(model_name)
         if not model_info:
             return False
@@ -399,59 +439,64 @@ class LocalModelManager:
         model_name: str,
         progress_callback: Optional[Callable[[float], None]] = None,
     ) -> bool:
-        """下载模型
+        """Download a model into the cache.
 
         Args:
-            model_name: 模型名称
-            progress_callback: 进度回调函数 (0.0 - 1.0)
+            model_name: Model name (must be in :data:`AVAILABLE_MODELS`).
+            progress_callback: Called with progress in ``[0.0, 1.0]``.
 
         Returns:
-            是否成功
+            True on success, False on failure.
         """
         model_info = self.get_model_info(model_name)
         if not model_info:
-            raise ValueError(f"未知模型: {model_name}")
+            raise ValueError(f"Unknown model: {model_name}")
 
+        # Lazily create the cache directory on first download only.
         model_dir = self._cache_dir / model_name
         model_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"开始下载模型 {model_name}...")
-        logger.info(f"  大小: {model_info.network.download_size_mb:.0f} MB")
-        logger.info(f"  类别: {model_info.category.value}")
-        logger.info(f"  语言: {', '.join(model_info.languages)}")
+        logger.info("Downloading model %s...", model_name)
+        logger.info("  size: %.0f MB", model_info.network.download_size_mb)
+        logger.info("  category: %s", model_info.category.value)
+        logger.info("  languages: %s", ", ".join(model_info.languages))
 
-        try:
-            if model_info.category == ModelCategory.SPEECH_TO_TEXT:
-                return self._download_whisper(model_name, model_info, progress_callback)
-            elif model_info.category == ModelCategory.EMBEDDING:
-                return self._download_embedding(model_name, model_info, progress_callback)
-            else:
-                logger.warning(f"暂不支持下载 {model_info.category.value} 类型模型")
-                return False
-        except Exception as e:
-            logger.error(f"下载失败: {e}")
+        # Dispatch to the category-specific downloader. Each downloader is
+        # responsible for its own transient-failure handling (returns False on
+        # runtime errors, re-raises ImportError for missing optional deps so
+        # the caller gets an actionable configuration error instead of a
+        # misleading "download failed" message).
+        if model_info.category == ModelCategory.SPEECH_TO_TEXT:
+            return self._download_whisper(model_name, progress_callback)
+        elif model_info.category == ModelCategory.EMBEDDING:
+            return self._download_embedding(model_name, model_info, progress_callback)
+        else:
+            logger.warning(
+                "Download for category %s is not supported.",
+                model_info.category.value,
+            )
             return False
 
     def _download_whisper(
         self,
         model_name: str,
-        model_info: ModelInfo,
         progress_callback: Optional[Callable[[float], None]] = None,
     ) -> bool:
-        """下载 Whisper 模型"""
+        """Download a Whisper model via ``openai-whisper``'s own loader."""
         try:
             import whisper
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
-                "需要安装 openai-whisper: pip install openai-whisper\n"
-                "或使用 faster-whisper: pip install faster-whisper"
-            )
+                "openai-whisper is required: pip install openai-whisper "
+                "(or faster-whisper: pip install faster-whisper)"
+            ) from exc
 
         whisper_name = model_name.replace("whisper-", "")
 
         try:
-            # whisper.load_model 会自动下载
-            model = whisper.load_model(
+            # whisper.load_model performs the download using its own URL
+            # resolution; the bytes are cached under download_root.
+            whisper.load_model(
                 whisper_name,
                 download_root=str(self._cache_dir),
             )
@@ -459,84 +504,91 @@ class LocalModelManager:
             if progress_callback:
                 progress_callback(1.0)
 
-            logger.info(f"模型 {model_name} 下载完成")
+            logger.info("Model %s downloaded.", model_name)
             return True
         except Exception as e:
-            logger.error(f"Whisper 模型下载失败: {e}")
+            logger.error("Whisper download failed: %s", e)
             return False
 
     def _download_embedding(
         self,
         model_name: str,
-        model_info: ModelInfo,
+        model_info: LocalModelInfo,
         progress_callback: Optional[Callable[[float], None]] = None,
     ) -> bool:
-        """下载嵌入模型"""
+        """Download an embedding model via ``sentence-transformers``.
+
+        When ``use_mirror`` is enabled and the model declares mirrors, the
+        first mirror is exported as ``HF_ENDPOINT`` so ``huggingface_hub``
+        (used internally by sentence-transformers) actually fetches from the
+        mirror instead of the default endpoint.
+        """
         try:
             from sentence_transformers import SentenceTransformer
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
-                "需要安装 sentence-transformers: pip install sentence-transformers"
-            )
+                "sentence-transformers is required: pip install sentence-transformers"
+            ) from exc
+
+        mirror_endpoint = self._select_mirror(model_info)
 
         try:
-            # 使用镜像
-            model_url = model_info.network.download_url
-            if self.config.use_mirror and model_info.network.mirrors:
-                model_url = model_info.network.mirrors[0]
-
-            model = SentenceTransformer(
-                model_name,
-                cache_folder=str(self._cache_dir),
-            )
+            with _export_hf_endpoint(mirror_endpoint):
+                SentenceTransformer(
+                    model_name,
+                    cache_folder=str(self._cache_dir),
+                )
 
             if progress_callback:
                 progress_callback(1.0)
 
-            logger.info(f"模型 {model_name} 下载完成")
+            logger.info("Model %s downloaded.", model_name)
             return True
         except Exception as e:
-            logger.error(f"嵌入模型下载失败: {e}")
+            logger.error("Embedding download failed: %s", e)
             return False
 
+    def _select_mirror(self, model_info: LocalModelInfo) -> Optional[str]:
+        """Pick the HF mirror endpoint to use, or ``None`` for the default."""
+        if not self.config.use_mirror:
+            return None
+        if not model_info.network.mirrors:
+            return None
+        return model_info.network.mirrors[0]
+
     def load(self, model_name: str) -> Any:
-        """加载模型
-
-        Args:
-            model_name: 模型名称
-
-        Returns:
-            模型实例
-        """
+        """Load (downloading first if needed) and cache a model instance."""
         if model_name in self._loaded_models:
             return self._loaded_models[model_name]
 
         model_info = self.get_model_info(model_name)
         if not model_info:
-            raise ValueError(f"未知模型: {model_name}")
+            raise ValueError(f"Unknown model: {model_name}")
 
         if not self.is_downloaded(model_name):
-            logger.info(f"模型 {model_name} 未下载，开始下载...")
+            logger.info("Model %s not cached, downloading...", model_name)
             self.download(model_name)
 
-        logger.info(f"加载模型 {model_name}...")
+        logger.info("Loading model %s...", model_name)
 
         if model_info.category == ModelCategory.SPEECH_TO_TEXT:
-            model = self._load_whisper(model_name)
+            model: Any = self._load_whisper(model_name)
         elif model_info.category == ModelCategory.EMBEDDING:
-            model = self._load_embedding(model_name)
+            model = self._load_embedding(model_name, model_info)
         else:
-            raise ValueError(f"不支持的模型类别: {model_info.category}")
+            raise ValueError(f"Unsupported model category: {model_info.category}")
 
         self._loaded_models[model_name] = model
         return model
 
-    def _load_whisper(self, model_name: str) -> "WhisperModel":
-        """加载 Whisper 模型"""
+    def _load_whisper(self, model_name: str) -> WhisperModel:
+        """Load a Whisper model."""
         try:
             import whisper
-        except ImportError:
-            raise ImportError("需要安装 openai-whisper: pip install openai-whisper")
+        except ImportError as exc:
+            raise ImportError(
+                "openai-whisper is required: pip install openai-whisper"
+            ) from exc
 
         whisper_name = model_name.replace("whisper-", "")
         device = self._get_device()
@@ -549,34 +601,38 @@ class LocalModelManager:
 
         return WhisperModel(model, model_name, device)
 
-    def _load_embedding(self, model_name: str) -> "EmbeddingModel":
-        """加载嵌入模型"""
+    def _load_embedding(self, model_name: str, model_info: LocalModelInfo) -> EmbeddingModel:
+        """Load an embedding model (applying the configured mirror)."""
         try:
             from sentence_transformers import SentenceTransformer
-        except ImportError:
-            raise ImportError("需要安装 sentence-transformers: pip install sentence-transformers")
+        except ImportError as exc:
+            raise ImportError(
+                "sentence-transformers is required: pip install sentence-transformers"
+            ) from exc
 
         device = self._get_device()
+        mirror_endpoint = self._select_mirror(model_info)
 
-        model = SentenceTransformer(
-            model_name,
-            cache_folder=str(self._cache_dir),
-            device=device,
-        )
+        with _export_hf_endpoint(mirror_endpoint):
+            model = SentenceTransformer(
+                model_name,
+                cache_folder=str(self._cache_dir),
+                device=device,
+            )
 
         return EmbeddingModel(model, model_name, device)
 
     def _get_device(self) -> str:
-        """获取计算设备"""
+        """Resolve the compute device. Falls back to ``cpu`` when torch is absent."""
         if self.config.device != "auto":
             return self.config.device
 
-        # 自动检测
         try:
             import torch
+
             if torch.cuda.is_available():
                 return "cuda"
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 return "mps"
         except ImportError:
             pass
@@ -584,32 +640,28 @@ class LocalModelManager:
         return "cpu"
 
     def unload(self, model_name: str) -> None:
-        """卸载模型，释放内存"""
+        """Unload a model from the in-memory cache."""
         if model_name in self._loaded_models:
             del self._loaded_models[model_name]
-            logger.info(f"已卸载模型 {model_name}")
+            logger.info("Unloaded model %s.", model_name)
 
     def clear_cache(self, model_name: Optional[str] = None) -> None:
-        """清除缓存
-
-        Args:
-            model_name: 指定模型，None 表示清除所有
-        """
+        """Clear the on-disk cache for one model, or all models if ``None``."""
         import shutil
 
         if model_name:
             model_dir = self._cache_dir / model_name
             if model_dir.exists():
                 shutil.rmtree(model_dir)
-                logger.info(f"已清除模型 {model_name} 缓存")
+                logger.info("Cleared cache for model %s.", model_name)
         else:
             if self._cache_dir.exists():
                 shutil.rmtree(self._cache_dir)
                 self._cache_dir.mkdir(parents=True, exist_ok=True)
-                logger.info("已清除所有模型缓存")
+                logger.info("Cleared all model caches.")
 
     def get_cache_size(self) -> float:
-        """获取缓存大小 (MB)"""
+        """Return the cache size in MB (0 if the cache does not exist)."""
         total_size = 0
         if self._cache_dir.exists():
             for path in self._cache_dir.rglob("*"):
@@ -618,10 +670,41 @@ class LocalModelManager:
         return total_size / (1024 * 1024)
 
 
-class WhisperModel:
-    """Whisper 语音转文字模型"""
+class _export_hf_endpoint:
+    """Context manager that temporarily exports ``HF_ENDPOINT``.
 
-    def __init__(self, model: Any, model_name: str, device: str):
+    ``huggingface_hub`` reads ``HF_ENDPOINT`` at download time, so setting it
+    around the ``SentenceTransformer`` constructor causes the actual download
+    to go through the mirror. When ``endpoint`` is ``None`` the environment is
+    left untouched.
+    """
+
+    def __init__(self, endpoint: Optional[str]) -> None:
+        self._endpoint = endpoint
+        self._previous: Optional[str] = None
+        self._had_previous = False
+
+    def __enter__(self) -> None:
+        if self._endpoint is None:
+            return
+        self._had_previous = "HF_ENDPOINT" in os.environ
+        self._previous = os.environ.get("HF_ENDPOINT")
+        os.environ["HF_ENDPOINT"] = self._endpoint
+
+    def __exit__(self, *exc: object) -> None:
+        if self._endpoint is None:
+            return
+        if self._had_previous:
+            # previous was a real string (not None) since the key existed
+            os.environ["HF_ENDPOINT"] = self._previous or ""
+        else:
+            os.environ.pop("HF_ENDPOINT", None)
+
+
+class WhisperModel:
+    """Whisper speech-to-text model wrapper."""
+
+    def __init__(self, model: Any, model_name: str, device: str) -> None:
         self._model = model
         self._model_name = model_name
         self._device = device
@@ -633,18 +716,19 @@ class WhisperModel:
         task: str = "transcribe",  # transcribe, translate
         verbose: bool = False,
     ) -> dict[str, Any]:
-        """转录音频
+        """Transcribe an audio file.
 
         Args:
-            audio_path: 音频文件路径 (支持 mp3, wav, m4a 等)
-            language: 语言代码 (zh, en, ja 等)，None 表示自动检测
-            task: transcribe 转录为原语言，translate 翻译为英文
-            verbose: 是否输出详细信息
+            audio_path: Path to an audio file (mp3, wav, m4a, ...).
+            language: Language code (zh, en, ja, ...). ``None`` auto-detects.
+            task: ``transcribe`` keeps the source language; ``translate``
+                translates to English.
+            verbose: If True, the underlying library prints progress.
 
         Returns:
-            包含 text, segments, language 等字段的字典
+            Dict with ``text``, ``segments`` and ``language``.
         """
-        logger.info(f"开始转录: {audio_path}")
+        logger.info("Transcribing: %s", audio_path)
 
         result = self._model.transcribe(
             audio_path,
@@ -660,36 +744,39 @@ class WhisperModel:
         }
 
     def detect_language(self, audio_path: str) -> str:
-        """检测音频语言"""
+        """Detect the dominant language of an audio file."""
         import whisper
+
         audio = whisper.load_audio(audio_path)
         audio = whisper.pad_or_trim(audio)
         mel = whisper.log_mel_spectrogram(audio).to(self._model.device)
         _, probs = self._model.detect_language(mel)
-        return max(probs, key=probs.get)
+        detected = max(probs, key=probs.get)
+        return str(detected)
 
 
 class EmbeddingModel:
-    """向量嵌入模型"""
+    """Sentence embedding model wrapper."""
 
-    def __init__(self, model: Any, model_name: str, device: str):
+    def __init__(self, model: Any, model_name: str, device: str) -> None:
         self._model = model
         self._model_name = model_name
         self._device = device
 
     def embed(self, text: str) -> list[float]:
-        """生成文本嵌入向量"""
+        """Embed a single text into a vector."""
         embedding = self._model.encode(text)
-        return embedding.tolist()
+        return embedding.tolist()  # type: ignore[no-any-return]
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """批量生成嵌入向量"""
+        """Embed a batch of texts."""
         embeddings = self._model.encode(texts)
         return [e.tolist() for e in embeddings]
 
     def similarity(self, text1: str, text2: str) -> float:
-        """计算两段文本的相似度"""
+        """Cosine similarity between two texts."""
         import numpy as np
+
         embeddings = self._model.encode([text1, text2])
         similarity = np.dot(embeddings[0], embeddings[1]) / (
             np.linalg.norm(embeddings[0]) * np.linalg.norm(embeddings[1])
@@ -702,69 +789,54 @@ class EmbeddingModel:
         documents: list[str],
         top_k: int = 5,
     ) -> list[tuple[int, float]]:
-        """在文档中搜索与查询最相似的
-
-        Args:
-            query: 查询文本
-            documents: 文档列表
-            top_k: 返回前 k 个结果
-
-        Returns:
-            (文档索引, 相似度分数) 的列表
-        """
+        """Return ``(doc_index, score)`` pairs for the top-k most similar docs."""
         import numpy as np
 
         query_embedding = self._model.encode(query)
         doc_embeddings = self._model.encode(documents)
 
-        # 计算余弦相似度
         similarities = np.dot(doc_embeddings, query_embedding) / (
             np.linalg.norm(doc_embeddings, axis=1) * np.linalg.norm(query_embedding)
         )
 
-        # 获取 top_k 索引
         top_indices = np.argsort(similarities)[::-1][:top_k]
 
         return [(int(i), float(similarities[i])) for i in top_indices]
 
 
 def check_hardware_requirements(model_name: str) -> dict[str, Any]:
-    """检查硬件是否满足模型需求
+    """Check whether the host hardware satisfies a model's requirements.
 
-    Returns:
-        {
-            "satisfied": bool,
-            "current_ram_gb": float,
-            "required_ram_gb": float,
-            "gpu_available": bool,
-            "gpu_name": str | None,
-            "gpu_vram_gb": float | None,
-        }
+    Returns a dict describing current vs required RAM and GPU state. Without
+    ``psutil`` installed the function returns a best-effort dict (``satisfied``
+    set to ``None``) rather than raising, and without ``torch`` the GPU branch
+    is skipped gracefully (no ``None >= float`` TypeError).
     """
     model_info = AVAILABLE_MODELS.get(model_name)
     if not model_info:
-        return {"satisfied": False, "error": f"未知模型: {model_name}"}
+        return {"satisfied": False, "error": f"Unknown model: {model_name}"}
 
-    # 获取当前内存
+    # Current RAM.
     try:
         import psutil
+
         current_ram_gb = psutil.virtual_memory().total / (1024**3)
     except ImportError:
-        # 如果 psutil 未安装，返回基本信息
         return {
             "satisfied": None,
-            "error": "需要安装 psutil: pip install psutil",
+            "error": "psutil is required: pip install psutil",
             "required_ram_gb": model_info.hardware.min_ram_gb,
             "supports_cpu": model_info.hardware.supports_cpu,
         }
 
-    # 检查 GPU
+    # GPU detection (optional).
     gpu_available = False
-    gpu_name = None
-    gpu_vram_gb = None
+    gpu_name: Optional[str] = None
+    gpu_vram_gb: Optional[float] = None
 
     try:
         import torch
+
         if torch.cuda.is_available():
             gpu_available = True
             gpu_name = torch.cuda.get_device_name(0)
@@ -772,12 +844,20 @@ def check_hardware_requirements(model_name: str) -> dict[str, Any]:
     except ImportError:
         pass
 
-    # 判断是否满足需求
     ram_satisfied = current_ram_gb >= model_info.hardware.min_ram_gb
-    gpu_satisfied = True
 
-    if model_info.hardware.min_gpu_vram_gb and not model_info.hardware.supports_cpu:
-        gpu_satisfied = gpu_available and gpu_vram_gb >= model_info.hardware.min_gpu_vram_gb
+    # GPU check only applies when the model requires GPU and cannot run on CPU.
+    # Guard against gpu_vram_gb being None (no torch / no CUDA) to avoid
+    # ``None >= float`` TypeError.
+    gpu_satisfied = True
+    if (
+        model_info.hardware.min_gpu_vram_gb is not None
+        and not model_info.hardware.supports_cpu
+    ):
+        if not gpu_available or gpu_vram_gb is None:
+            gpu_satisfied = False
+        else:
+            gpu_satisfied = gpu_vram_gb >= model_info.hardware.min_gpu_vram_gb
 
     return {
         "satisfied": ram_satisfied and gpu_satisfied,
@@ -786,7 +866,7 @@ def check_hardware_requirements(model_name: str) -> dict[str, Any]:
         "recommended_ram_gb": model_info.hardware.recommended_ram_gb,
         "gpu_available": gpu_available,
         "gpu_name": gpu_name,
-        "gpu_vram_gb": round(gpu_vram_gb, 1) if gpu_vram_gb else None,
+        "gpu_vram_gb": round(gpu_vram_gb, 1) if gpu_vram_gb is not None else None,
         "required_gpu_vram_gb": model_info.hardware.min_gpu_vram_gb,
         "supports_cpu": model_info.hardware.supports_cpu,
     }

@@ -10,7 +10,6 @@ import pytest
 from vertai.data import DocParser
 from vertai.data.parser import (
     ExcelParser,
-    MarkdownParser,
     PDFParser,
     PPTParser,
     WordParser,
@@ -23,7 +22,6 @@ class TestBaseParser:
     def test_base_parser_cannot_instantiate(self):
         """Test that BaseParser cannot be instantiated directly."""
         from vertai.data.parser import BaseParser
-        import abc
 
         # BaseParser is abstract, so it should raise TypeError
         with pytest.raises(TypeError):

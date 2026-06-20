@@ -1,18 +1,45 @@
-"""AI Agent SDK - 批阅评审模块"""
+"""Evaluation / reviewer scenario (S3 generalize).
+
+Generalizes the previous ``Reviewer`` into an LLM-as-judge
+:class:`Evaluation` abstraction that depends on
+:class:`~vertai.core.provider.LLMProvider` (not the legacy ``LLMEngine``
+single-prompt API). :class:`Reviewer` is the concrete criteria-based judge.
+
+The provider is obtained via :func:`~vertai.core.provider.create_provider` (or
+injection); generation uses ``provider.generate([ChatMessage])`` and reads
+``result.content``. Input is sanitized against prompt injection (English +
+Chinese patterns).
+"""
+
+from __future__ import annotations
 
 import json
 import re
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from vertai.core.llm import LLMConfig, LLMEngine
+from vertai.core.llm import LLMEngine
+from vertai.core.provider import (
+    ChatMessage,
+    LLMConfig,
+    LLMProvider,
+    create_provider,
+)
+
+__all__ = [
+    "ReviewResult",
+    "ReviewerConfig",
+    "Evaluation",
+    "Reviewer",
+]
 
 
 @dataclass
 class ReviewResult:
-    """评审结果"""
+    """A single evaluation result."""
 
     score: int
     criteria_scores: dict[str, int]
@@ -22,241 +49,232 @@ class ReviewResult:
 
 
 class ReviewerConfig(BaseModel):
-    """评审器配置
+    """Reviewer configuration."""
 
-    示例:
-        # 使用默认配置
-        config = ReviewerConfig()
-
-        # 自定义配置
-        config = ReviewerConfig(
-            max_score=50,
-            model="llama3.2",
-        )
-    """
-
-    max_score: int = Field(default=100, ge=1, le=1000, description="最高分数")
-    model: Optional[str] = Field(default=None, description="模型名称")
-    template: Optional[str] = Field(default=None, description="评审模板")
-    max_submission_length: int = Field(default=10000, ge=1, description="提交内容最大长度")
-    max_reference_length: int = Field(default=5000, ge=1, description="参考答案最大长度")
+    max_score: int = Field(default=100, ge=1, le=1000, description="max score")
+    model: Optional[str] = Field(default=None, description="model name")
+    template: Optional[str] = Field(default=None, description="review template")
+    max_submission_length: int = Field(default=10000, ge=1, description="max submission length")
+    max_reference_length: int = Field(default=5000, ge=1, description="max reference length")
 
     model_config = {"extra": "forbid"}
 
 
-class Reviewer:
-    """批阅评审器
+# Prompt-injection patterns sanitized out of submissions / references. Covers
+# English and Chinese injection attempts. Compiled with re.IGNORECASE (inline
+# ``(?i)`` is illegal mid-expression on Python 3.11+).
+_INJECTION_PATTERNS = [
+    r"system\s*:",
+    r"assistant\s*:",
+    r"user\s*:",
+    r"ignore\s+(previous|all|prior)\s*(instructions?|prompts?)",
+    r"forget\s+(everything|all)",
+    r"disregard\s+",
+    r"忽略(之前|上面|前面|上述)(的)?(指令|提示|规则)",
+    r"忘记(之前|所有)(的)?(指令|内容)",
+    r"你现在(扮演|是)",
+    r"无视(之前|上述)(的)?(指令|规则)",
+    r"<<<\s*.*?\s*>>>",
+    r"<\|.*?\|>",
+]
+_INJECTION_RE = re.compile("|".join(_INJECTION_PATTERNS), re.IGNORECASE)
+_REDACTION = "[removed]"
 
-    支持自定义评审标准，输出评分、批语和建议。
+
+class Evaluation(ABC):
+    """Generalized LLM-as-judge evaluation abstraction.
+
+    Subclasses implement :meth:`evaluate`. The LLM is accessed through the
+    :class:`LLMProvider` abstraction: pass ``provider=`` directly, or pass
+    ``llm=`` an :class:`~vertai.core.llm.LLMEngine` (its ``.provider`` is
+    extracted). With neither, a provider is built from
+    :func:`~vertai.core.provider.create_provider` (default Ollama config).
+    """
+
+    def __init__(
+        self,
+        *,
+        config: ReviewerConfig | None = None,
+        provider: LLMProvider | None = None,
+        llm: LLMEngine | None = None,
+        llm_config: LLMConfig | None = None,
+    ) -> None:
+        self.config = config or ReviewerConfig()
+        self._provider: LLMProvider | None = provider or (
+            llm.provider if isinstance(llm, LLMEngine) else None
+        )
+        self._llm_engine: LLMEngine | None = llm
+        self._llm_config: LLMConfig | None = llm_config
+
+    @abstractmethod
+    def evaluate(
+        self, submission: str, reference: Optional[str] = None
+    ) -> ReviewResult:
+        """Evaluate ``submission`` (optionally against ``reference``)."""
+
+    def get_provider(self) -> LLMProvider:
+        """Return the LLM provider (injected, or built from config)."""
+        if self._provider is not None:
+            return self._provider
+        if self._llm_engine is not None:
+            return self._llm_engine.provider
+        model = self.config.model
+        config = LLMConfig(model=model) if model else (self._llm_config or LLMConfig())
+        return create_provider(config)
+
+    @staticmethod
+    def _sanitize_input(text: str) -> str:
+        """Redact prompt-injection patterns and strip control characters."""
+        cleaned = _INJECTION_RE.sub(_REDACTION, text)
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", cleaned)
+        return cleaned.strip()
+
+
+class Reviewer(Evaluation):
+    """Criteria-based LLM-as-judge reviewer.
 
     Args:
-        criteria: 评审标准列表，不能为空
-        config: 评审器配置，可选
-        llm: LLM引擎实例，可选
+        criteria: review criteria; must be non-empty.
+        config: optional :class:`ReviewerConfig`.
+        provider: optional :class:`LLMProvider` (preferred injection point).
+        llm: optional :class:`LLMEngine` (its ``.provider`` is used).
+        llm_config: optional :class:`LLMConfig` for the default provider.
 
     Raises:
-        ValueError: 当 criteria 为空时
+        ValueError: if ``criteria`` is empty.
 
-    使用示例:
-        reviewer = Reviewer(
-            criteria=["准确性", "完整性", "格式规范"],
-        )
+    Example:
+        reviewer = Reviewer(criteria=["accuracy", "completeness"], provider=prov)
         result = reviewer.evaluate(submission)
     """
 
     def __init__(
         self,
         criteria: list[str],
-        config: Optional[ReviewerConfig] = None,
-        llm: Optional[LLMEngine] = None,
-    ):
+        config: ReviewerConfig | None = None,
+        provider: LLMProvider | None = None,
+        llm: LLMEngine | None = None,
+        llm_config: LLMConfig | None = None,
+    ) -> None:
+        super().__init__(
+            config=config, provider=provider, llm=llm, llm_config=llm_config
+        )
         if not criteria:
-            raise ValueError("评审标准不能为空")
-
-        self.criteria = criteria
-        self.config = config or ReviewerConfig()
-        self._llm = llm
+            raise ValueError("criteria must not be empty")
+        self.criteria = list(criteria)
 
     @property
     def max_score(self) -> int:
-        """最高分数"""
         return self.config.max_score
 
     @property
     def model(self) -> Optional[str]:
-        """模型名称"""
         return self.config.model
 
     @property
     def template(self) -> Optional[str]:
-        """评审模板"""
         return self.config.template
 
-    def evaluate(self, submission: str, reference: Optional[str] = None) -> ReviewResult:
-        """评审提交内容
+    def evaluate(
+        self, submission: str, reference: Optional[str] = None
+    ) -> ReviewResult:
+        """Evaluate ``submission`` (optionally against ``reference``).
 
-        Args:
-            submission: 待评审的内容
-            reference: 参考答案，可选
-
-        Returns:
-            ReviewResult: 评审结果
-
-        Raises:
-            ValueError: 当提交内容为空或超过长度限制时
+        Raises ``ValueError`` if the submission is empty or exceeds the length
+        limit.
         """
         if not submission or not submission.strip():
-            raise ValueError("提交内容不能为空")
+            raise ValueError("submission must not be empty")
 
-        validated_submission = self._validate_input(submission, self.config.max_submission_length, "提交内容")
-        validated_reference = None
+        validated_submission = self._validate_input(
+            submission, self.config.max_submission_length, "submission"
+        )
+        validated_reference: Optional[str] = None
         if reference:
-            validated_reference = self._validate_input(reference, self.config.max_reference_length, "参考答案")
+            validated_reference = self._validate_input(
+                reference, self.config.max_reference_length, "reference"
+            )
 
-        llm = self._get_llm()
+        provider = self.get_provider()
         prompt = self._build_prompt(validated_submission, validated_reference)
-        response = llm.generate(prompt)
-        return self._parse_response(response.content)
+        result = provider.generate([ChatMessage(role="user", content=prompt)])
+        return self._parse_response(result.content)
 
-    def _validate_input(self, text: str, max_length: int, field_name: str) -> str:
-        """验证并清理输入内容，防止提示词注入
-
-        Args:
-            text: 输入文本
-            max_length: 最大长度限制
-            field_name: 字段名称，用于错误提示
-
-        Returns:
-            str: 验证后的文本
-
-        Raises:
-            ValueError: 当内容超过长度限制时
-        """
+    def _validate_input(
+        self, text: str, max_length: int, field_name: str
+    ) -> str:
         if len(text) > max_length:
-            raise ValueError(f"{field_name}超过最大长度限制 ({max_length} 字符)")
-
-        cleaned = self._sanitize_input(text)
-        return cleaned
-
-    def _sanitize_input(self, text: str) -> str:
-        """清理输入内容，移除潜在的提示词注入
-
-        Args:
-            text: 原始文本
-
-        Returns:
-            str: 清理后的文本
-        """
-        dangerous_patterns = [
-            r'(?i)system\s*:',
-            r'(?i)assistant\s*:',
-            r'(?i)user\s*:',
-            r'(?i)ignore\s+(previous|all)\s*(instructions|prompts)',
-            r'(?i)forget\s+(everything|all)',
-            r'(?i)disregard\s+',
-            r'<<<\s*.*?\s*>>>',
-            r'<\|.*?\|>',
-        ]
-
-        cleaned = text
-        for pattern in dangerous_patterns:
-            cleaned = re.sub(pattern, '[已移除]', cleaned)
-
-        return cleaned.strip()
-
-    def _get_llm(self) -> LLMEngine:
-        """获取LLM引擎"""
-        if self._llm:
-            return self._llm
-        config = LLMConfig(model=self.config.model) if self.config.model else LLMConfig()
-        return LLMEngine(config=config)
+            raise ValueError(
+                f"{field_name} exceeds max length limit ({max_length} characters)"
+            )
+        return self._sanitize_input(text)
 
     def _build_prompt(self, submission: str, reference: Optional[str]) -> str:
-        """构建评审提示词
-
-        Args:
-            submission: 已验证的提交内容
-            reference: 已验证的参考答案，可选
-
-        Returns:
-            str: 构建的提示词
-        """
-        criteria_text = "、".join(self.criteria)
-
+        criteria_text = ", ".join(self.criteria)
         prompt_parts = [
-            f"请根据以下评审标准对提交内容进行评审：{criteria_text}",
+            f"Review the submission against these criteria: {criteria_text}",
             "",
-            "评审标准详情：",
+            "Criteria detail:",
         ]
-
+        per_criterion = self.max_score // max(len(self.criteria), 1)
         for i, criterion in enumerate(self.criteria, 1):
-            prompt_parts.append(f"{i}. {criterion}（满分{self.max_score // len(self.criteria)}分）")
-
-        prompt_parts.extend([
-            "",
-            "待评审内容：",
-            submission,
-        ])
-
+            prompt_parts.append(
+                f"{i}. {criterion} (max {per_criterion} points)"
+            )
+        prompt_parts.extend(["", "Submission:", submission])
         if reference:
-            prompt_parts.extend([
+            prompt_parts.extend(["", "Reference:", reference])
+        prompt_parts.extend(
+            [
                 "",
-                "参考答案：",
-                reference,
-            ])
-
-        prompt_parts.extend([
-            "",
-            "请按以下JSON格式输出评审结果：",
-            "{",
-            '  "score": 总分（整数）,',
-            '  "criteria_scores": {"标准名": 分数},',
-            '  "comments": "整体评价",',
-            '  "suggestions": ["改进建议1", "改进建议2"]',
-            "}",
-        ])
-
+                "Output the review result as JSON:",
+                "{",
+                '  "score": <int total>,',
+                '  "criteria_scores": {"<criterion>": <int>},',
+                '  "comments": "<overall comment>",',
+                '  "suggestions": ["<suggestion>", ...]',
+                "}",
+            ]
+        )
         return "\n".join(prompt_parts)
 
     def _parse_response(self, response: str) -> ReviewResult:
-        """解析LLM响应
-
-        Args:
-            response: LLM返回的原始响应
-
-        Returns:
-            ReviewResult: 解析后的评审结果
-        """
+        """Parse the LLM JSON response into a :class:`ReviewResult`."""
         json_match = re.search(r"\{[\s\S]*\}", response)
         if not json_match:
             return ReviewResult(
                 score=0,
                 criteria_scores={c: 0 for c in self.criteria},
-                comments="无法解析评审结果",
-                suggestions=["请重新提交评审"],
+                comments="unable to parse review result",
+                suggestions=["please resubmit the review"],
                 details={"raw_response": response},
             )
-
         try:
             data = json.loads(json_match.group())
         except json.JSONDecodeError:
             return ReviewResult(
                 score=0,
                 criteria_scores={c: 0 for c in self.criteria},
-                comments="评审结果格式错误",
-                suggestions=["请重新提交评审"],
+                comments="review result format error",
+                suggestions=["please resubmit the review"],
                 details={"raw_response": response},
             )
 
-        criteria_scores = data.get("criteria_scores", {})
+        criteria_scores: dict[str, int] = {
+            str(k): int(v) for k, v in dict(data.get("criteria_scores", {})).items()
+        }
         for criterion in self.criteria:
             if criterion not in criteria_scores:
                 criteria_scores[criterion] = 0
-
+        raw_score = data.get("score", 0)
+        try:
+            score_int = int(raw_score)
+        except (TypeError, ValueError):
+            score_int = 0
         return ReviewResult(
-            score=min(max(data.get("score", 0), 0), self.max_score),
+            score=min(max(score_int, 0), self.max_score),
             criteria_scores=criteria_scores,
-            comments=data.get("comments", ""),
-            suggestions=data.get("suggestions", []),
+            comments=str(data.get("comments", "")),
+            suggestions=list(data.get("suggestions", [])),
             details={"raw_response": response},
         )

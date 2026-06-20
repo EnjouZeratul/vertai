@@ -1,8 +1,13 @@
-# VertAI | 垂直AI智能体SDK
+# VertAI
 
-垂直领域 AI 智能体开发 SDK，支持完全离线运行。
+> ⚠️ **Alpha.** Core abstractions (LLMProvider / Embedding / Retriever / TextSplitter /
+> Tool / Agent / Callbacks / Vector / Memory / Workflow / Output) are implemented and
+> the public API is consolidating, but it is **not yet production-ready**. See
+> `docs/ROADMAP.md` for the path to 1.0 and `docs/ARCHITECTURE.md` for the design.
 
-A vertical-domain AI agent development SDK designed for fully offline operation.
+A local-first, lightweight AI agent SDK for vertical-domain rapid development.
+
+面向垂直领域快速开发的本地优先、轻量 AI 智能体 SDK。
 
 ## 设计理念 | Design Philosophy
 

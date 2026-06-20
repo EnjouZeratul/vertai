@@ -8,7 +8,6 @@ from vertai.output.docgen import (
     OutputFormat,
     TemplateType,
     Template,
-    BUILTIN_TEMPLATES,
 )
 
 

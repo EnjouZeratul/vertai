@@ -11,7 +11,6 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 import html
-import re
 
 
 class OutputFormat(Enum):
@@ -136,7 +135,7 @@ class DocGen:
         """Get current output format."""
         return self._format
 
-    def generate(self, data: dict[str, Any]) -> str:
+    def generate(self, data: dict[str, Any]) -> str | bytes:
         """Generate a document from the provided data.
 
         Args:
@@ -144,10 +143,12 @@ class DocGen:
                   template sections.
 
         Returns:
-            Generated document as a string.
+            Generated document. ``str`` for markdown/html formats,
+            ``bytes`` for the PDF format (when a real PDF backend is wired in).
 
         Raises:
             ValueError: If required template sections are missing from data.
+            NotImplementedError: For the PDF format until a real backend is wired.
         """
         content = self._build_content(data)
 
@@ -384,14 +385,22 @@ class DocGen:
     def save(self, data: dict[str, Any], filepath: str) -> None:
         """Generate and save document to a file.
 
+        Writes text output in UTF-8 text mode (markdown/html) and binary
+        output in bytes mode (pdf), matching the type returned by
+        :meth:`generate`.
+
         Args:
             data: Document content data.
             filepath: Output file path.
         """
         content = self.generate(data)
 
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
+        if isinstance(content, bytes):
+            with open(filepath, "wb") as f:
+                f.write(content)
+        else:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
 
     @classmethod
     def list_templates(cls) -> list[str]:

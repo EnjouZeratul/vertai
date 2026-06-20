@@ -32,9 +32,6 @@ from vertai import (
     # DocGen - 报告生成 | DocGen - Report Generation
     DocGen,
 
-    # Dashboard - 数据可视化 | Dashboard - Data Visualization
-    Dashboard, Metric, Chart, ChartType,
-
     # LocalModelManager - 本地模型 | LocalModelManager - Local Models
     LocalModelManager, check_hardware_requirements,
 
@@ -54,7 +51,7 @@ def example_1_basic_llm_chat():
         provider=ModelProvider.DEEPSEEK,
         base_url="https://api.deepseek.com/anthropic",  # 必须指定! | Must specify!
         api_key="sk-xxx",  # 或设置环境变量 VERTAI_API_KEY | Or set environment variable VERTAI_API_KEY
-        model="deepseek-v4-flash",
+        model="deepseek-chat",
     )
 
     # 快速使用 | Quick usage
@@ -86,8 +83,29 @@ def example_2_knowledge_qa():
     print("示例2: 知识库问答 | Example 2: Knowledge Base Q&A")
     print("="*60)
 
-    # 创建知识库 (完全本地，无需 LLM) | Create knowledge base (fully local, no LLM needed)
-    qa = KnowledgeQA()
+    # 知识库需要一个 EmbeddingProvider 来把文本转成向量。
+    # 真实语义搜索请安装 vertai[embeddings] 并使用 LocalSentenceTransformerProvider。
+    # 这里用一个简单的确定性函数演示（不具备语义相似性，仅演示 API）。
+    #
+    # A knowledge base needs an EmbeddingProvider to vectorize text. For real
+    # semantic search install vertai[embeddings] and use
+    # LocalSentenceTransformerProvider. Here we use a simple deterministic
+    # function for demonstration (NOT semantically meaningful).
+    from vertai.core.embedding import FunctionEmbeddingProvider
+
+    def demo_embedding_fn(text: str) -> list[float]:
+        # 演示用：基于字符的确定性向量（无语义）。| Demo: deterministic char-based vector (non-semantic).
+        vec = [0.0] * 32
+        for ch in text:
+            vec[ord(ch) % 32] += 1.0
+        norm = sum(v * v for v in vec) ** 0.5
+        return [v / norm for v in vec] if norm else vec
+
+    embedding_provider = FunctionEmbeddingProvider(demo_embedding_fn, dimension=32)
+
+    # 创建知识库 (索引与检索完全本地，无需 LLM) | Create knowledge base
+    # (indexing + retrieval are fully local, no LLM needed)
+    qa = KnowledgeQA(embedding_provider=embedding_provider)
 
     # 添加文档 | Add documents
     docs = [
@@ -96,16 +114,23 @@ def example_2_knowledge_qa():
         Document(content="加班规定：工作日加班需要提前申请，周末加班按双倍工资计算。"),
     ]
     qa.add_documents(docs)
+    print(f"已索引 {qa.count_documents()} 个文档 | Indexed {qa.count_documents()} documents")
 
-    # 搜索知识库 (向量搜索，完全本地) | Search knowledge base (vector search, fully local)
+    # 搜索知识库 (向量检索，完全本地) | Search knowledge base (vector retrieval, fully local)
     print("\n知识库搜索 | Knowledge base search:")
-    results = qa._vector_engine.search("报销流程")
+    results = qa._get_retriever().retrieve("报销流程", top_k=2)
     for r in results[:2]:
         print(f"  - 相似度: {r.score:.2f} | Similarity: {r.score:.2f}")
         print(f"    内容: {r.document.content[:50]}... | Content: {r.document.content[:50]}...")
 
-    # 问答 (需要 LLM 生成) | Q&A (requires LLM generation)
-    # answer = qa.ask("报销需要什么材料？")
+    # 问答 (需要 LLM 生成) | Q&A (requires an LLM provider for generation)
+    # from vertai.core.provider import LLMConfig, create_provider
+    # qa_with_llm = KnowledgeQA(
+    #     embedding_provider=embedding_provider,
+    #     provider=create_provider(LLMConfig()),  # 默认 Ollama | default Ollama
+    # )
+    # qa_with_llm.add_documents(docs)
+    # answer = qa_with_llm.ask("报销需要什么材料？")
     # print(f"\n问答结果: {answer.answer} | Q&A result: {answer.answer}")
 
 
@@ -177,7 +202,7 @@ def example_5_document_processing():
 
     # 需要实际文件路径 | Requires actual file path
     # result = parser.parse("report.pdf")
-    # print(f"解析结果: {result['content'][:50]}... | Parse result: {result['content'][:50]}...")
+    # print(f"解析结果: {result['text'][:50]}... | Parse result: {result['text'][:50]}...")
 
     print("文档解析需要实际文件路径，支持 | Document parsing requires actual file path, supports: PDF, Word, Excel, PPT, Markdown")
 
@@ -192,10 +217,20 @@ def example_5_document_processing():
 
 
 def example_6_dashboard():
-    """示例6: 数据可视化仪表盘 | Example 6: Data Visualization Dashboard"""
+    """示例6: 数据可视化仪表盘 | Example 6: Data Visualization Dashboard
+
+    Dashboard moved to the optional ``vertai[viz]`` extra. Install with
+    ``pip install vertai[viz]`` to run this example.
+    """
     print("\n" + "="*60)
     print("示例6: 数据可视化仪表盘 | Example 6: Data Visualization Dashboard")
     print("="*60)
+
+    try:
+        from vertai.viz.dashboard import Dashboard, ChartType  # noqa: F401
+    except ImportError:
+        print("Dashboard 需要可选依赖 | Dashboard requires the optional extra: pip install vertai[viz]")
+        return
 
     # 创建仪表盘 | Create dashboard
     dashboard = Dashboard(title="业务监控 | Business Monitoring")

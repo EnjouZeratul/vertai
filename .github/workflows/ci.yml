@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint-type-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff
+        run: ruff check vertai/ tests/
+
+      - name: Mypy (strict)
+        run: mypy --strict vertai/
+
+      - name: Build (twine check)
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+
+      - name: Unit tests
+        run: pytest tests/ -v --tb=short --cov=vertai --cov-report=term-missing
+
+      - name: Integration tests (real API, optional)
+        if: ${{ env.VERTAI_API_KEY != '' }}
+        env:
+          VERTAI_API_KEY: ${{ secrets.VERTAI_API_KEY }}
+        run: pytest tests/test_deepseek_integration.py -v --tb=short
+        continue-on-error: true  # integration is best-effort; flakes in upstream API do not fail CI
+
+  coverage-gate:
+    # Run on a single Python version to enforce a coverage floor on critical paths.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]"
+      # Critical-path coverage floors (not line-chasing): the modules that do real
+      # I/O and reasoning must be well-covered by non-mock tests.
+      - name: Coverage floors on critical modules
+        run: |
+          pytest tests/ --cov=vertai --cov-report=term-missing --cov-fail-under=90

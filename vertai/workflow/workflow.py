@@ -1,31 +1,35 @@
-"""
-Workflow 工作流编排模块
+"""Workflow orchestration engine.
 
-核心功能:
-- 步骤编排（顺序执行）
-- 条件分支（if/else）
-- 循环执行（while/for）
-- 并行执行
+Core capabilities:
+- Sequential step execution
+- Conditional branching (if/else)
+- Loop execution (for items)
+- Parallel execution with a thread-safe shared context
+
+Design notes (S6):
+- All builders (``step`` / ``branch`` / ``parallel`` / ``loop``) return ``self`` so
+  the workflow is chainable: ``Workflow().step(...).parallel(...).run()``.
+- The shared :class:`WorkflowContext` is guarded by a lock so parallel steps
+  cannot lose updates when concurrently writing the same key.
+- ``ParallelConfig.timeout`` and ``WorkflowConfig.timeout`` are real: a parallel
+  step whose futures do not resolve in time is cancelled and reported FAILED;
+  the whole ``run`` is bounded by the workflow timeout.
 """
 
 from __future__ import annotations
 
+import re
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import (
-    Any,
-    Callable,
-    Optional,
-    Union,
-)
+from typing import Any, Callable, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
-
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 # ============================================================================
-# 配置常量
+# Configuration constants
 # ============================================================================
 
 DEFAULT_MAX_WORKERS = 4
@@ -33,15 +37,21 @@ DEFAULT_TIMEOUT = 300.0
 DEFAULT_RETRY_COUNT = 0
 DEFAULT_RETRY_DELAY = 1.0
 MAX_STEP_NAME_LENGTH = 100
-STEP_NAME_PATTERN = r'^[a-zA-Z0-9_\-一-龥]+$'
+# Letters, digits, underscore, hyphen, and CJK ideographs (U+4E00 - U+9FFF).
+STEP_NAME_PATTERN = r"^[a-zA-Z0-9_\-一-龥]+$"
+_NAME_RE = re.compile(STEP_NAME_PATTERN)
+
+# Name used for a synthesized StepResult when a parallel future raised before
+# producing a result of its own.
+_ORPHAN_PARALLEL_TASK = "parallel_task"
 
 
 # ============================================================================
-# 枚举类型
+# Enumerations
 # ============================================================================
 
 class StepStatus(str, Enum):
-    """步骤状态枚举"""
+    """Status of a single step execution."""
 
     PENDING = "pending"
     RUNNING = "running"
@@ -51,14 +61,14 @@ class StepStatus(str, Enum):
 
 
 class LoopType(str, Enum):
-    """循环类型枚举"""
+    """Loop strategy."""
 
     FOR = "for"
     WHILE = "while"
 
 
 class StepType(str, Enum):
-    """步骤类型枚举"""
+    """Discriminator for :class:`Step`."""
 
     SIMPLE = "simple"
     BRANCH = "branch"
@@ -67,188 +77,149 @@ class StepType(str, Enum):
 
 
 # ============================================================================
-# 配置类
+# Configuration models
 # ============================================================================
 
 class WorkflowConfig(BaseModel):
-    """Workflow 配置
+    """Top-level workflow configuration.
 
-    示例:
-        # 使用默认配置
-        config = WorkflowConfig()
-
-        # 自定义配置
-        config = WorkflowConfig(
-            max_workers=8,
-            timeout=600.0,
-            retry_count=2,
-        )
+    Example:
+        >>> WorkflowConfig()  # defaults
+        >>> WorkflowConfig(max_workers=8, timeout=600.0, retry_count=2)
     """
 
     max_workers: int = Field(
-        default=DEFAULT_MAX_WORKERS,
-        ge=1,
-        le=32,
-        description="并行执行最大线程数"
+        default=DEFAULT_MAX_WORKERS, ge=1, le=32, description="Max threads for parallel steps"
     )
     timeout: float = Field(
-        default=DEFAULT_TIMEOUT,
-        ge=1.0,
-        description="工作流超时时间(秒)"
+        default=DEFAULT_TIMEOUT, ge=1.0, description="Whole-workflow timeout in seconds"
     )
-    retry_count: int = Field(
-        default=DEFAULT_RETRY_COUNT,
-        ge=0,
-        le=10,
-        description="失败重试次数"
-    )
-    retry_delay: float = Field(
-        default=DEFAULT_RETRY_DELAY,
-        ge=0.0,
-        description="重试延迟(秒)"
-    )
+    retry_count: int = Field(default=DEFAULT_RETRY_COUNT, ge=0, le=10, description="Retries on failure")
+    retry_delay: float = Field(default=DEFAULT_RETRY_DELAY, ge=0.0, description="Delay between retries (s)")
     continue_on_error: bool = Field(
-        default=False,
-        description="步骤失败时是否继续执行"
+        default=False, description="Whether to keep running after a step fails"
     )
 
-    model_config = ConfigDict(
-        extra="forbid",
-        validate_default=True,
-    )
+    model_config = ConfigDict(extra="forbid", validate_default=True)
 
 
 class ParallelConfig(BaseModel):
-    """并行执行配置
+    """Configuration for a parallel step.
 
-    示例:
-        config = ParallelConfig(
-            max_workers=4,
-            timeout=60.0,
-        )
+    ``timeout`` is real: each parallel step's futures are awaited with this
+    budget; any future that has not resolved in time is cancelled and the step
+    is reported FAILED.
+
+    Example:
+        >>> ParallelConfig(max_workers=4, timeout=60.0)
     """
 
     max_workers: int = Field(
-        default=DEFAULT_MAX_WORKERS,
-        ge=1,
-        le=32,
-        description="最大并行线程数"
+        default=DEFAULT_MAX_WORKERS, ge=1, le=32, description="Max parallel threads"
     )
     timeout: float = Field(
-        default=DEFAULT_TIMEOUT,
-        ge=1.0,
-        description="并行执行超时时间(秒)"
+        default=DEFAULT_TIMEOUT, ge=1.0, description="Per-step parallel timeout in seconds"
     )
 
-    model_config = ConfigDict(
-        extra="forbid",
-        validate_default=True,
-    )
+    model_config = ConfigDict(extra="forbid", validate_default=True)
 
 
 class LoopConfig(BaseModel):
-    """循环执行配置
+    """Configuration for a loop step.
 
-    示例:
-        config = LoopConfig(
-            loop_type=LoopType.WHILE,
-            max_iterations=100,
-        )
+    Example:
+        >>> LoopConfig(loop_type=LoopType.WHILE, max_iterations=100)
     """
 
-    loop_type: LoopType = Field(
-        default=LoopType.FOR,
-        description="循环类型"
-    )
-    max_iterations: int = Field(
-        default=100,
-        ge=1,
-        le=10000,
-        description="最大迭代次数"
-    )
-    break_on_error: bool = Field(
-        default=True,
-        description="出错时是否中断循环"
-    )
+    loop_type: LoopType = Field(default=LoopType.FOR, description="Loop strategy")
+    max_iterations: int = Field(default=100, ge=1, le=10000, description="Hard iteration cap")
+    break_on_error: bool = Field(default=True, description="Stop the loop on the first failure")
 
-    model_config = ConfigDict(
-        extra="forbid",
-        validate_default=True,
-    )
+    model_config = ConfigDict(extra="forbid", validate_default=True)
 
 
 # ============================================================================
-# 上下文类
+# Shared execution context (thread-safe)
 # ============================================================================
 
 class WorkflowContext(BaseModel):
-    """工作流执行上下文
+    """Execution context shared across steps.
 
-    用于在步骤间传递数据和状态。
+    The ``data`` and ``metadata`` dicts are mutated by step functions, including
+    from concurrent threads during a parallel step. All accessors take a lock so
+    concurrent writers cannot lose updates.
 
-    示例:
-        ctx = WorkflowContext()
-        ctx.set("key", "value")
-        value = ctx.get("key")
+    Example:
+        >>> ctx = WorkflowContext()
+        >>> ctx.set("key", "value")
+        >>> ctx.get("key")
+        'value'
     """
 
-    data: dict[str, Any] = Field(default_factory=dict, description="上下文数据")
-    metadata: dict[str, Any] = Field(default_factory=dict, description="元数据")
+    data: dict[str, Any] = Field(default_factory=dict, description="Context data")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="Metadata")
 
-    model_config = ConfigDict(
-        extra="forbid",
-    )
+    model_config = ConfigDict(extra="forbid")
+
+    # Private attribute (not validated/serialized). RLock allows nested locking
+    # from the same thread: ``get``/``set``/``update``/``clear`` all acquire it
+    # and may be called from inside a ``with ctx.lock:`` block the user holds.
+    _lock: threading.RLock = PrivateAttr(default_factory=threading.RLock)
+
+    @property
+    def lock(self) -> threading.RLock:
+        """Return the context's lock.
+
+        Each individual ``get`` / ``set`` / ``update`` / ``clear`` is atomic,
+        so concurrent writers cannot corrupt the dict. A *compound*
+        read-modify-write (``ctx.set(k, ctx.get(k) + 1)``) is NOT atomic by
+        itself; callers that need that should hold this lock explicitly::
+
+            with ctx.lock:
+                ctx.set("counter", ctx.get("counter") + 1)
+
+        The lock is reentrant, so ``get``/``set`` work correctly inside that
+        ``with`` block.
+        """
+        return self._lock
 
     def get(self, key: str, default: Any = None) -> Any:
-        """获取上下文数据
-
-        Args:
-            key: 数据键名
-            default: 默认值
-
-        Returns:
-            对应的数据值，如果不存在则返回默认值
-        """
-        return self.data.get(key, default)
+        """Return ``data[key]`` if present, else ``default``."""
+        with self._lock:
+            return self.data.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
-        """设置上下文数据
-
-        Args:
-            key: 数据键名
-            value: 数据值
-        """
-        self.data[key] = value
+        """Store ``value`` under ``key``."""
+        with self._lock:
+            self.data[key] = value
 
     def update(self, data: dict[str, Any]) -> None:
-        """批量更新上下文数据
-
-        Args:
-            data: 要更新的数据字典
-        """
-        self.data.update(data)
+        """Merge ``data`` into the context atomically."""
+        with self._lock:
+            self.data.update(data)
 
     def clear(self) -> None:
-        """清空上下文数据"""
-        self.data.clear()
-        self.metadata.clear()
+        """Drop all data and metadata."""
+        with self._lock:
+            self.data.clear()
+            self.metadata.clear()
 
 
 # ============================================================================
-# 结果类
+# Result dataclasses
 # ============================================================================
 
 @dataclass
 class StepResult:
-    """步骤执行结果
+    """Result of executing one step.
 
     Attributes:
-        name: 步骤名称
-        status: 执行状态
-        output: 输出数据
-        error: 错误信息
-        duration: 执行时长(秒)
-        retries: 重试次数
+        name: Step name.
+        status: Outcome status.
+        output: Optional payload produced by the step.
+        error: Optional human-readable error message.
+        duration: Wall-clock duration in seconds.
+        retries: Number of retries that were performed.
     """
 
     name: str
@@ -261,14 +232,14 @@ class StepResult:
 
 @dataclass
 class WorkflowResult:
-    """工作流执行结果
+    """Result of executing the whole workflow.
 
     Attributes:
-        success: 是否成功
-        steps: 各步骤结果
-        context: 最终上下文
-        total_duration: 总执行时长(秒)
-        error: 错误信息
+        success: True iff no step failed (or failures were tolerated).
+        steps: Per-step results, in execution order.
+        context: Final shared context.
+        total_duration: Wall-clock duration in seconds.
+        error: Optional aggregated error message.
     """
 
     success: bool
@@ -279,25 +250,21 @@ class WorkflowResult:
 
 
 # ============================================================================
-# 步骤定义
+# Step definition
 # ============================================================================
 
 @dataclass
 class Step:
-    """步骤定义
+    """A single workflow step.
 
-    Attributes:
-        name: 步骤名称
-        step_type: 步骤类型
-        func: 执行函数
-        condition: 执行条件
-        branch_yes: 条件分支-是
-        branch_no: 条件分支-否
-        parallel_steps: 并行步骤列表
-        loop_items: 循环项
-        step_template: 步骤模板
-        loop_config: 循环配置
-        parallel_config: 并行配置
+    The meaning of the fields depends on ``step_type``:
+
+    - ``SIMPLE``: ``func`` runs against the context (``condition`` optional).
+    - ``BRANCH``: ``func`` is the predicate; ``branch_yes``/``branch_no`` are
+      the two sequential sub-lists.
+    - ``PARALLEL``: ``parallel_steps`` runs concurrently.
+    - ``LOOP``: ``loop_items`` is a list or callable returning a list;
+      ``step_template`` produces a :class:`Step` per item.
     """
 
     name: str
@@ -314,115 +281,88 @@ class Step:
 
 
 # ============================================================================
-# 验证函数
+# Validation helpers
 # ============================================================================
 
 def _validate_step_name(name: str) -> str:
-    """验证步骤名称
-
-    Args:
-        name: 步骤名称
-
-    Returns:
-        验证后的步骤名称
+    """Validate a step name and return it on success.
 
     Raises:
-        ValueError: 步骤名称无效
+        ValueError: If the name is empty, too long, or contains characters
+            outside ``[A-Za-z0-9_-]`` and CJK ideographs.
     """
-    import re
-
     if not name:
-        raise ValueError("步骤名称不能为空")
+        raise ValueError("Step name must not be empty")
 
     if len(name) > MAX_STEP_NAME_LENGTH:
-        raise ValueError(f"步骤名称过长，最大 {MAX_STEP_NAME_LENGTH} 个字符")
+        raise ValueError(f"Step name too long: max {MAX_STEP_NAME_LENGTH} chars")
 
-    if not re.match(STEP_NAME_PATTERN, name):
+    if not _NAME_RE.match(name):
         raise ValueError(
-            f"步骤名称 '{name}' 包含非法字符。"
-            "只允许字母、数字、下划线(_)、连字符(-)和中文。"
+            f"Step name '{name}' contains illegal characters. "
+            "Allowed: letters, digits, underscore (_), hyphen (-), and CJK."
         )
 
     return name
 
 
 # ============================================================================
-# Workflow 主类
+# Workflow
 # ============================================================================
 
+# Type alias for the tuple form users pass to ``branch`` / ``parallel``.
+StepSpec = tuple[str, Callable[[WorkflowContext], Any]]
+
+
 class Workflow:
-    """工作流编排引擎
+    """Workflow orchestration engine.
 
-    支持步骤编排、条件分支、循环执行和并行执行。
+    Supports sequential steps, conditional branches, loops, and parallel
+    execution. Builders return ``self`` so a workflow can be fluently chained
+    and then run in one expression:
 
-    示例:
-        # 基本用法
-        wf = Workflow()
-        wf.step("步骤1", lambda ctx: ctx.set("result", "done"))
-        result = wf.run()
+        >>> result = (
+        ...     Workflow()
+        ...     .step("setup", lambda ctx: ctx.set("ready", True))
+        ...     .parallel([("a", task_a), ("b", task_b)])
+        ...     .run()
+        ... )
 
-        # 条件分支
-        wf = Workflow()
-        wf.step("检查", check_fn)
-        wf.branch(
-            condition=lambda ctx: ctx.get("need_test"),
-            yes_steps=[
-                ("测试", test_fn),
-            ],
-            no_steps=[
-                ("部署", deploy_fn),
-            ]
-        )
-
-        # 并行执行
-        wf = Workflow()
-        wf.parallel([
-            ("任务A", task_a),
-            ("任务B", task_b),
-        ])
-
-        # 循环执行
-        wf = Workflow()
-        wf.loop(
-            items=["a", "b", "c"],
-            step_name_template=lambda item: f"处理{item}",
-            step_func_template=lambda item: lambda ctx: process(item, ctx),
-        )
+    For ergonomics, ``last_step`` exposes the most recently added :class:`Step`
+    object so callers that need the underlying definition can still reach it.
     """
 
-    def __init__(self, config: Optional[WorkflowConfig] = None):
-        """初始化工作流
-
-        Args:
-            config: 工作流配置
-        """
+    def __init__(self, config: Optional[WorkflowConfig] = None) -> None:
+        """Initialize with optional ``config`` (defaults are applied otherwise)."""
         self.config = config or WorkflowConfig()
         self._steps: list[Step] = []
         self._step_names: set[str] = set()
+        self._last_step: Optional[Step] = None
+
+    # ----- builders (all return self for chaining) ---------------------------
 
     def step(
         self,
         name: str,
         func: Callable[[WorkflowContext], Any],
         condition: Optional[Callable[[WorkflowContext], bool]] = None,
-    ) -> Step:
-        """添加顺序执行步骤
+    ) -> "Workflow":
+        """Append a sequential step.
 
         Args:
-            name: 步骤名称
-            func: 执行函数，接收上下文参数
-            condition: 执行条件函数，返回 True 时执行
+            name: Unique step name.
+            func: Step body taking the shared context.
+            condition: Optional predicate; when it returns False the step is
+                skipped.
 
         Returns:
-            步骤对象
+            ``self`` (for chaining).
 
         Raises:
-            ValueError: 步骤名称无效或重复
+            ValueError: Invalid or duplicate name.
         """
         validated_name = _validate_step_name(name)
-
-        if validated_name in self._step_names:
-            raise ValueError(f"步骤名称 '{validated_name}' 已存在")
+        self._check_unique(validated_name)
 
         step_obj = Step(
             name=validated_name,
@@ -430,121 +370,82 @@ class Workflow:
             func=func,
             condition=condition,
         )
-        self._steps.append(step_obj)
-        self._step_names.add(validated_name)
-
-        return step_obj
+        self._append(step_obj)
+        return self
 
     def branch(
         self,
         condition: Callable[[WorkflowContext], bool],
-        yes_steps: Optional[list[tuple[str, Callable[[WorkflowContext], Any]]]] = None,
-        no_steps: Optional[list[tuple[str, Callable[[WorkflowContext], Any]]]] = None,
+        yes_steps: Optional[list[StepSpec]] = None,
+        no_steps: Optional[list[StepSpec]] = None,
         name: Optional[str] = None,
-    ) -> Step:
-        """添加条件分支
+    ) -> "Workflow":
+        """Append a conditional branch.
 
         Args:
-            condition: 条件函数，返回 True 执行 yes_steps 分支
-            yes_steps: 条件为 True 时执行的步骤列表，格式为 [(name, func), ...]
-            no_steps: 条件为 False 时执行的步骤列表，格式为 [(name, func), ...]
-            name: 分支名称（可选）
+            condition: Predicate over the context. ``True`` selects
+                ``yes_steps``; ``False`` selects ``no_steps``.
+            yes_steps: Steps to run when the predicate is True.
+            no_steps: Steps to run when the predicate is False.
+            name: Optional step name; auto-generated when omitted.
 
         Returns:
-            分支步骤对象
+            ``self`` (for chaining).
 
         Raises:
-            ValueError: 条件函数为空
+            ValueError: Condition is None or name is invalid/duplicate.
         """
         if condition is None:
-            raise ValueError("条件函数不能为空")
+            raise ValueError("Branch condition must not be None")
 
         branch_name = name or f"branch_{len(self._step_names)}"
         validated_name = _validate_step_name(branch_name)
-
-        if validated_name in self._step_names:
-            raise ValueError(f"步骤名称 '{validated_name}' 已存在")
-
-        # 创建分支步骤
-        yes_list: list[Step] = []
-        if yes_steps:
-            for step_name, step_func in yes_steps:
-                yes_list.append(Step(
-                    name=step_name,
-                    step_type=StepType.SIMPLE,
-                    func=step_func,
-                ))
-
-        no_list: list[Step] = []
-        if no_steps:
-            for step_name, step_func in no_steps:
-                no_list.append(Step(
-                    name=step_name,
-                    step_type=StepType.SIMPLE,
-                    func=step_func,
-                ))
+        self._check_unique(validated_name)
 
         step_obj = Step(
             name=validated_name,
             step_type=StepType.BRANCH,
             func=condition,
-            branch_yes=yes_list,
-            branch_no=no_list,
+            branch_yes=self._materialize_steps(yes_steps),
+            branch_no=self._materialize_steps(no_steps),
         )
-
-        self._steps.append(step_obj)
-        self._step_names.add(validated_name)
-
-        return step_obj
+        self._append(step_obj)
+        return self
 
     def parallel(
         self,
-        steps: list[tuple[str, Callable[[WorkflowContext], Any]]],
+        steps: list[StepSpec],
         config: Optional[ParallelConfig] = None,
         name: Optional[str] = None,
-    ) -> Step:
-        """添加并行执行步骤
+    ) -> "Workflow":
+        """Append a parallel step.
 
         Args:
-            steps: 并行执行的步骤列表，格式为 [(name, func), ...]
-            config: 并行配置
-            name: 步骤名称（可选）
+            steps: Non-empty list of ``(name, func)`` tuples run concurrently.
+            config: Optional :class:`ParallelConfig` (workers + timeout).
+            name: Optional step name; auto-generated when omitted.
 
         Returns:
-            并行步骤对象
+            ``self`` (for chaining).
 
         Raises:
-            ValueError: 步骤列表为空
+            ValueError: Empty step list, or invalid/duplicate name.
         """
         if not steps:
-            raise ValueError("并行步骤列表不能为空")
+            raise ValueError("Parallel step list must not be empty")
 
         parallel_name = name or f"parallel_{len(self._step_names)}"
         validated_name = _validate_step_name(parallel_name)
-
-        if validated_name in self._step_names:
-            raise ValueError(f"步骤名称 '{validated_name}' 已存在")
-
-        # 创建并行步骤
-        parallel_list: list[Step] = []
-        for step_name, step_func in steps:
-            parallel_list.append(Step(
-                name=step_name,
-                step_type=StepType.SIMPLE,
-                func=step_func,
-            ))
+        self._check_unique(validated_name)
 
         step_obj = Step(
             name=validated_name,
             step_type=StepType.PARALLEL,
-            parallel_steps=parallel_list,
+            parallel_steps=self._materialize_steps(steps),
             parallel_config=config,
         )
-
-        self._steps.append(step_obj)
-        self._step_names.add(validated_name)
-
-        return step_obj
+        self._append(step_obj)
+        return self
 
     def loop(
         self,
@@ -553,116 +454,123 @@ class Workflow:
         step_func_template: Callable[[Any], Callable[[WorkflowContext], Any]],
         config: Optional[LoopConfig] = None,
         name: Optional[str] = None,
-    ) -> Step:
-        """添加循环执行步骤
+    ) -> "Workflow":
+        """Append a loop step.
 
         Args:
-            items: 要迭代的项列表或获取列表的函数
-            step_name_template: 步骤名称模板函数，接收项参数返回步骤名称
-            step_func_template: 步骤函数模板，接收项参数返回执行函数
-            config: 循环配置
-            name: 步骤名称（可选）
+            items: Either a literal list or a callable that resolves the list
+                against the context at execution time.
+            step_name_template: Maps an item to a step name.
+            step_func_template: Maps an item to the step body.
+            config: Optional :class:`LoopConfig`.
+            name: Optional step name; auto-generated when omitted.
 
         Returns:
-            循环步骤对象
+            ``self`` (for chaining).
 
         Raises:
-            ValueError: 步骤模板为空
+            ValueError: A template is None or name is invalid/duplicate.
         """
         if step_name_template is None or step_func_template is None:
-            raise ValueError("步骤名称模板和函数模板不能为空")
+            raise ValueError("Loop name/func templates must not be None")
 
         loop_name = name or f"loop_{len(self._step_names)}"
         validated_name = _validate_step_name(loop_name)
+        self._check_unique(validated_name)
 
-        if validated_name in self._step_names:
-            raise ValueError(f"步骤名称 '{validated_name}' 已存在")
+        def _make_step(item: Any) -> Step:
+            return Step(
+                name=step_name_template(item),
+                step_type=StepType.SIMPLE,
+                func=step_func_template(item),
+            )
 
         step_obj = Step(
             name=validated_name,
             step_type=StepType.LOOP,
             loop_items=items,
-            step_template=lambda item: Step(
-                name=step_name_template(item),
-                step_type=StepType.SIMPLE,
-                func=step_func_template(item),
-            ),
+            step_template=_make_step,
             loop_config=config or LoopConfig(),
         )
+        self._append(step_obj)
+        return self
 
-        self._steps.append(step_obj)
-        self._step_names.add(validated_name)
-
-        return step_obj
+    # ----- run ---------------------------------------------------------------
 
     def run(
         self,
         initial_data: Optional[dict[str, Any]] = None,
     ) -> WorkflowResult:
-        """执行工作流
+        """Execute the workflow.
 
         Args:
-            initial_data: 初始上下文数据
+            initial_data: Optional seed for the shared context.
 
         Returns:
-            工作流执行结果
+            The :class:`WorkflowResult`.
+
+        Timeout semantics:
+            ``config.timeout`` is a real wall-clock budget checked between
+            steps. If the deadline has already passed before dispatching the
+            next step, the run stops, is reported with ``success=False`` and
+            ``error="Workflow timed out after <N>s"``, and contains the results
+            gathered so far. Steps themselves are bounded by their own
+            mechanisms (parallel steps by ``ParallelConfig.timeout``); the
+            workflow-level timeout prevents a long chain of sequential steps
+            from running indefinitely.
         """
         start_time = time.time()
         context = WorkflowContext(data=initial_data or {})
+        deadline = start_time + self.config.timeout
+
         results: list[StepResult] = []
         success = True
         error_msg: Optional[str] = None
+        has_any_failure = False
+        timed_out = False
 
-        try:
-            has_any_failure = False
-            for step_obj in self._steps:
-                result = self._execute_step(step_obj, context)
-                results.append(result)
+        for step_obj in self._steps:
+            if time.time() >= deadline:
+                timed_out = True
+                break
 
-                if result.status == StepStatus.FAILED:
-                    has_any_failure = True
-                    if not self.config.continue_on_error:
-                        success = False
-                        error_msg = result.error
-                        break
+            result = self._execute_step(step_obj, context)
+            results.append(result)
 
-            # 即使 continue_on_error=True，如果有失败，整体仍标记为失败
-            if has_any_failure:
-                success = False
-                if not error_msg:
-                    error_msg = "部分步骤执行失败"
+            if result.status == StepStatus.FAILED:
+                has_any_failure = True
+                if not self.config.continue_on_error:
+                    success = False
+                    error_msg = result.error
+                    break
 
-        except RuntimeError as e:
+        # With continue_on_error=True, the run is still marked failed if any
+        # step failed, but every step had a chance to run.
+        if has_any_failure:
             success = False
-            error_msg = str(e)
-        except ValueError as e:
-            success = False
-            error_msg = str(e)
+            if not error_msg:
+                error_msg = "One or more steps failed"
 
-        total_duration = time.time() - start_time
+        if timed_out:
+            success = False
+            error_msg = f"Workflow timed out after {self.config.timeout}s"
 
         return WorkflowResult(
             success=success,
             steps=results,
             context=context,
-            total_duration=total_duration,
+            total_duration=time.time() - start_time,
             error=error_msg,
         )
+
+    # ----- per-step execution ------------------------------------------------
 
     def _execute_step(
         self,
         step_obj: Step,
         context: WorkflowContext,
     ) -> StepResult:
-        """执行单个步骤
-
-        Args:
-            step_obj: 步骤对象
-            context: 执行上下文
-
-        Returns:
-            步骤执行结果
-        """
+        """Dispatch a step to its type-specific executor."""
         start_time = time.time()
 
         if step_obj.step_type == StepType.BRANCH:
@@ -674,7 +582,6 @@ class Workflow:
         if step_obj.step_type == StepType.LOOP:
             return self._execute_loop(step_obj, context, start_time)
 
-        # 普通步骤
         return self._execute_simple(step_obj, context, start_time)
 
     def _execute_simple(
@@ -683,16 +590,7 @@ class Workflow:
         context: WorkflowContext,
         start_time: float,
     ) -> StepResult:
-        """执行简单步骤
-
-        Args:
-            step_obj: 步骤对象
-            context: 执行上下文
-            start_time: 开始时间
-
-        Returns:
-            步骤执行结果
-        """
+        """Execute a SIMPLE step, honoring ``condition`` and retries."""
         if step_obj.func is None:
             return StepResult(
                 name=step_obj.name,
@@ -700,7 +598,8 @@ class Workflow:
                 duration=time.time() - start_time,
             )
 
-        # 检查条件
+        # Evaluate the condition first; a failing predicate is a SKIP, not a
+        # failure.
         if step_obj.condition is not None:
             try:
                 if not step_obj.condition(context):
@@ -709,15 +608,14 @@ class Workflow:
                         status=StepStatus.SKIPPED,
                         duration=time.time() - start_time,
                     )
-            except Exception as e:
+            except Exception as exc:
                 return StepResult(
                     name=step_obj.name,
                     status=StepStatus.FAILED,
-                    error=f"条件检查失败: {e}",
+                    error=f"Condition check failed: {exc}",
                     duration=time.time() - start_time,
                 )
 
-        # 执行步骤
         last_error: Optional[str] = None
         for attempt in range(self.config.retry_count + 1):
             try:
@@ -729,8 +627,8 @@ class Workflow:
                     duration=time.time() - start_time,
                     retries=attempt,
                 )
-            except Exception as e:
-                last_error = str(e)
+            except Exception as exc:
+                last_error = str(exc)
                 if attempt < self.config.retry_count:
                     time.sleep(self.config.retry_delay)
 
@@ -748,21 +646,10 @@ class Workflow:
         context: WorkflowContext,
         start_time: float,
     ) -> StepResult:
-        """执行分支步骤
-
-        Args:
-            step_obj: 步骤对象
-            context: 执行上下文
-            start_time: 开始时间
-
-        Returns:
-            步骤执行结果
-        """
+        """Execute a BRANCH step."""
         try:
-            # func 存储条件函数
-            condition_result = step_obj.func(context) if step_obj.func else False
-
-            # 选择分支
+            # ``func`` stores the condition predicate.
+            condition_result = bool(step_obj.func(context)) if step_obj.func else False
             branches = step_obj.branch_yes if condition_result else step_obj.branch_no
 
             if not branches:
@@ -773,21 +660,19 @@ class Workflow:
                     duration=time.time() - start_time,
                 )
 
-            # 执行分支步骤
             branch_results: list[StepResult] = []
             for branch_step in branches:
                 result = self._execute_step(branch_step, context)
                 branch_results.append(result)
 
-                if result.status == StepStatus.FAILED:
-                    if not self.config.continue_on_error:
-                        return StepResult(
-                            name=step_obj.name,
-                            status=StepStatus.FAILED,
-                            error=f"分支步骤 '{result.name}' 失败: {result.error}",
-                            output=branch_results,
-                            duration=time.time() - start_time,
-                        )
+                if result.status == StepStatus.FAILED and not self.config.continue_on_error:
+                    return StepResult(
+                        name=step_obj.name,
+                        status=StepStatus.FAILED,
+                        error=f"Branch step '{result.name}' failed: {result.error}",
+                        output=branch_results,
+                        duration=time.time() - start_time,
+                    )
 
             return StepResult(
                 name=step_obj.name,
@@ -796,11 +681,11 @@ class Workflow:
                 duration=time.time() - start_time,
             )
 
-        except Exception as e:
+        except Exception as exc:
             return StepResult(
                 name=step_obj.name,
                 status=StepStatus.FAILED,
-                error=str(e),
+                error=str(exc),
                 duration=time.time() - start_time,
             )
 
@@ -810,15 +695,21 @@ class Workflow:
         context: WorkflowContext,
         start_time: float,
     ) -> StepResult:
-        """执行并行步骤
+        """Execute a PARALLEL step with a real per-step timeout.
 
-        Args:
-            step_obj: 步骤对象
-            context: 执行上下文
-            start_time: 开始时间
+        Each sub-step runs on the shared thread pool. We wait for the futures
+        with the configured timeout (from ``parallel_config`` or the
+        workflow-level budget); any future that has not resolved in time is
+        cancelled and reported FAILED, and the executor is shut down without
+        blocking so the workflow returns promptly at the deadline. The shared
+        :class:`WorkflowContext` is lock-protected, so concurrent writers do
+        not lose updates.
 
-        Returns:
-            步骤执行结果
+        Note: Python cannot forcibly kill a running thread, so a sub-step that
+        ignores the deadline may keep running in the background until the
+        interpreter tears it down. The contract we honor is that
+        ``_execute_parallel`` returns at (or very near) the deadline with
+        FAILED results for any sub-step that has not finished.
         """
         steps = step_obj.parallel_steps or []
         if not steps:
@@ -828,58 +719,91 @@ class Workflow:
                 duration=time.time() - start_time,
             )
 
-        # 获取并行配置
         parallel_config = step_obj.parallel_config
-        max_workers = (
-            parallel_config.max_workers
-            if parallel_config
-            else self.config.max_workers
-        )
+        max_workers = parallel_config.max_workers if parallel_config else self.config.max_workers
+        timeout = parallel_config.timeout if parallel_config else self.config.timeout
 
-        futures: list[Future[StepResult]] = []
+        results: list[StepResult] = []
+        has_error = False
+        error_msg: Optional[str] = None
 
-        try:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                for s in steps:
-                    future = executor.submit(self._execute_step, s, context)
-                    futures.append(future)
+        # Manage the executor manually so that on timeout we can call
+        # ``shutdown(wait=False, cancel_futures=True)`` and return immediately
+        # rather than blocking on the slow worker. ``cancel_futures`` is
+        # Python 3.9+; the project targets 3.10+.
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        future_to_step: dict[Future[StepResult], Step] = {}
+        for sub_step in steps:
+            future = executor.submit(self._execute_step, sub_step, context)
+            future_to_step[future] = sub_step
 
-            # 收集结果
-            results: list[StepResult] = []
-            has_error = False
-            error_msg: Optional[str] = None
+        deadline = start_time + timeout
+        pending: set[Future[StepResult]] = set(future_to_step.keys())
 
-            for future in futures:
-                try:
-                    result = future.result()
-                    results.append(result)
-                    if result.status == StepStatus.FAILED:
-                        has_error = True
-                        error_msg = result.error
-                except Exception as e:
-                    has_error = True
-                    error_msg = str(e)
-                    results.append(StepResult(
-                        name="parallel_task",
+        # Poll until every future resolves or the deadline passes.
+        while pending:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            done_now, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+            if not done_now:
+                # No future finished within the remaining budget.
+                break
+
+        # Anything still in ``pending`` hit the deadline: cancel + synthesize.
+        if pending:
+            for future in pending:
+                future.cancel()
+            # Stop the pool without joining the still-running workers.
+            executor.shutdown(wait=False, cancel_futures=True)
+            for future in pending:
+                sub_step = future_to_step[future]
+                has_error = True
+                if error_msg is None:
+                    error_msg = f"Parallel task '{sub_step.name}' timed out after {timeout}s"
+                results.append(
+                    StepResult(
+                        name=sub_step.name,
                         status=StepStatus.FAILED,
-                        error=str(e),
-                    ))
+                        error=f"timed out after {timeout}s",
+                        duration=time.time() - start_time,
+                    )
+                )
+        else:
+            executor.shutdown(wait=True)
 
-            return StepResult(
-                name=step_obj.name,
-                status=StepStatus.FAILED if has_error else StepStatus.COMPLETED,
-                output=results,
-                error=error_msg,
-                duration=time.time() - start_time,
-            )
+        # Materialize results in submission order, skipping ones already added
+        # above (the timed-out pending set).
+        already_added: set[Future[StepResult]] = set(pending)
+        for future, sub_step in future_to_step.items():
+            if future in already_added:
+                continue
+            try:
+                result = future.result()
+                results.append(result)
+                if result.status == StepStatus.FAILED:
+                    has_error = True
+                    if error_msg is None:
+                        error_msg = result.error
+            except Exception as exc:
+                has_error = True
+                if error_msg is None:
+                    error_msg = str(exc)
+                results.append(
+                    StepResult(
+                        name=sub_step.name,
+                        status=StepStatus.FAILED,
+                        error=str(exc),
+                    )
+                )
 
-        except Exception as e:
-            return StepResult(
-                name=step_obj.name,
-                status=StepStatus.FAILED,
-                error=str(e),
-                duration=time.time() - start_time,
-            )
+        return StepResult(
+            name=step_obj.name,
+            status=StepStatus.FAILED if has_error else StepStatus.COMPLETED,
+            output=results,
+            error=error_msg,
+            duration=time.time() - start_time,
+        )
 
     def _execute_loop(
         self,
@@ -887,54 +811,39 @@ class Workflow:
         context: WorkflowContext,
         start_time: float,
     ) -> StepResult:
-        """执行循环步骤
-
-        Args:
-            step_obj: 步骤对象
-            context: 执行上下文
-            start_time: 开始时间
-
-        Returns:
-            步骤执行结果
-        """
+        """Execute a LOOP step, honoring ``max_iterations`` and ``break_on_error``."""
         loop_config = step_obj.loop_config or LoopConfig()
 
         try:
-            # 获取迭代项
-            if step_obj.loop_items is not None:
-                if callable(step_obj.loop_items):
-                    items = step_obj.loop_items(context)
-                else:
-                    items = step_obj.loop_items
+            if step_obj.loop_items is None:
+                items: list[Any] = []
+            elif callable(step_obj.loop_items):
+                items = step_obj.loop_items(context)
             else:
-                items = []
+                items = list(step_obj.loop_items)
 
             if not isinstance(items, list):
                 items = list(items) if items else []
 
             results: list[StepResult] = []
-            iteration = 0
-
-            for item in items:
+            for iteration, item in enumerate(items):
                 if iteration >= loop_config.max_iterations:
                     break
 
-                iteration += 1
+                if step_obj.step_template is None:
+                    continue
+                template_step = step_obj.step_template(item)
+                result = self._execute_step(template_step, context)
+                results.append(result)
 
-                # 创建步骤
-                if step_obj.step_template is not None:
-                    step_template = step_obj.step_template(item)
-                    result = self._execute_step(step_template, context)
-                    results.append(result)
-
-                    if result.status == StepStatus.FAILED and loop_config.break_on_error:
-                        return StepResult(
-                            name=step_obj.name,
-                            status=StepStatus.FAILED,
-                            error=f"循环步骤失败: {result.error}",
-                            output=results,
-                            duration=time.time() - start_time,
-                        )
+                if result.status == StepStatus.FAILED and loop_config.break_on_error:
+                    return StepResult(
+                        name=step_obj.name,
+                        status=StepStatus.FAILED,
+                        error=f"Loop step failed: {result.error}",
+                        output=results,
+                        duration=time.time() - start_time,
+                    )
 
             return StepResult(
                 name=step_obj.name,
@@ -943,20 +852,55 @@ class Workflow:
                 duration=time.time() - start_time,
             )
 
-        except Exception as e:
+        except Exception as exc:
             return StepResult(
                 name=step_obj.name,
                 status=StepStatus.FAILED,
-                error=str(e),
+                error=str(exc),
                 duration=time.time() - start_time,
             )
 
+    # ----- bookkeeping -------------------------------------------------------
+
     def clear(self) -> None:
-        """清空工作流步骤"""
+        """Drop every added step."""
         self._steps.clear()
         self._step_names.clear()
+        self._last_step = None
 
     @property
     def steps(self) -> list[Step]:
-        """获取所有步骤"""
+        """Return a defensive copy of all added steps."""
         return list(self._steps)
+
+    @property
+    def last_step(self) -> Optional[Step]:
+        """The most recently added :class:`Step`, or None."""
+        return self._last_step
+
+    # ----- internals ---------------------------------------------------------
+
+    def _check_unique(self, name: str) -> None:
+        if name in self._step_names:
+            raise ValueError(f"Step name '{name}' already exists")
+
+    def _append(self, step_obj: Step) -> None:
+        self._steps.append(step_obj)
+        self._step_names.add(step_obj.name)
+        self._last_step = step_obj
+
+    @staticmethod
+    def _materialize_steps(specs: Optional[list[StepSpec]]) -> list[Step]:
+        """Convert a list of ``(name, func)`` tuples into SIMPLE steps."""
+        steps: list[Step] = []
+        if not specs:
+            return steps
+        for step_name, step_func in specs:
+            steps.append(
+                Step(
+                    name=step_name,
+                    step_type=StepType.SIMPLE,
+                    func=step_func,
+                )
+            )
+        return steps

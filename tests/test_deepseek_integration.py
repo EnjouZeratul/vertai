@@ -1,14 +1,20 @@
-"""DeepSeek API 真实集成测试
+"""DeepSeek API real integration tests (S2).
 
-使用真实 API 调用验证功能。
-运行前设置环境变量: VERTAI_API_KEY=sk-xxx
+Executes against the real DeepSeek Anthropic-compatible API when
+``VERTAI_API_KEY`` is set. Without the key the integration tests are skipped
+(not silently faked). Run with:
+
+    VERTAI_API_KEY=sk-xxx pytest tests/test_deepseek_integration.py -v
+
+Note: the real DeepSeek chat model is ``deepseek-chat`` (the previous
+``deepseek-v4-flash`` was a fabricated name).
 """
 
 import os
 import sys
 import pytest
+import httpx
 
-# 设置标准输出编码
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -23,16 +29,14 @@ from vertai.core.vector import VectorEngine, Document
 from vertai.output.structured import StructuredOutput
 
 
-# 从环境变量读取 API Key
 TEST_API_KEY = os.environ.get("VERTAI_API_KEY")
 TEST_BASE_URL = "https://api.deepseek.com/anthropic"
-TEST_MODEL = "deepseek-v4-flash"
+TEST_MODEL = "deepseek-chat"
 
 
-# 需要 API Key 的集成测试跳过标记
 requires_api_key = pytest.mark.skipif(
     not TEST_API_KEY,
-    reason="需要设置环境变量 VERTAI_API_KEY 才能运行集成测试",
+    reason="Set VERTAI_API_KEY to run real DeepSeek integration tests",
 )
 
 
@@ -178,26 +182,14 @@ class TestConfigValidation:
         )
         assert anthropic_config.is_anthropic_compatible()
 
-    def test_missing_api_key_raises_error(self):
-        """测试缺少 API Key 时抛出错误"""
-        config = LLMConfig(
-            provider=ModelProvider.DEEPSEEK,
-            api_key=None,
-        )
-        # 清除环境变量
-        old_key = os.environ.pop("VERTAI_API_KEY", None)
-        old_anthropic = os.environ.pop("ANTHROPIC_API_KEY", None)
-
-        try:
-            engine = LLMEngine(config)
-            with pytest.raises(RuntimeError, match="API 密钥"):
-                engine.generate("test")
-        finally:
-            # 恢复环境变量
-            if old_key:
-                os.environ["VERTAI_API_KEY"] = old_key
-            if old_anthropic:
-                os.environ["ANTHROPIC_API_KEY"] = old_anthropic
+    def test_missing_api_key_raises_error(self, monkeypatch: pytest.MonkeyPatch):
+        """Missing API key must raise before any request is made."""
+        monkeypatch.delenv("VERTAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        config = LLMConfig(provider=ModelProvider.DEEPSEEK, api_key=None)
+        engine = LLMEngine(config)
+        with pytest.raises(RuntimeError, match="API key"):
+            engine.generate("test")
 
 
 class TestStructuredOutputWithLLM:
@@ -257,7 +249,6 @@ class TestVectorEngineWithCustomEmbedding:
         """测试使用自定义嵌入函数的向量引擎"""
         # 使用自定义嵌入函数（注意：随机向量不具备语义相似性）
         def embedding_fn(text: str) -> list[float]:
-            import hashlib
             import random
             random.seed(hash(text) % (2**32))
             return [random.gauss(0, 1) for _ in range(384)]
@@ -287,7 +278,6 @@ class TestVectorEngineWithCustomEmbedding:
     def test_custom_embedding_consistency(self, deepseek_engine):
         """测试自定义嵌入函数的一致性"""
         def embedding_fn(text: str) -> list[float]:
-            import hashlib
             import random
             random.seed(hash(text) % (2**32))
             return [random.gauss(0, 1) for _ in range(128)]
@@ -300,14 +290,13 @@ class TestVectorEngineWithCustomEmbedding:
         # 不同文本应产生不同向量
         vec3 = embedding_fn("不同文本")
         assert vec1 != vec3
-        print(f"\n嵌入一致性验证通过")
+        print("\n嵌入一致性验证通过")
 
     @requires_api_key
     def test_embedding_batch(self, deepseek_engine):
         """测试批量嵌入"""
         # 创建自定义嵌入函数
         def batch_embedding_fn(text: str) -> list[float]:
-            import hashlib
             import random
             random.seed(hash(text) % (2**32))
             return [random.gauss(0, 1) for _ in range(128)]
@@ -315,13 +304,14 @@ class TestVectorEngineWithCustomEmbedding:
         from vertai.core.vector import CustomEmbedding
         embedding = CustomEmbedding(batch_embedding_fn)
 
-        # 测试单个嵌入
+        # 测试单个嵌入 (embed always returns list[list[float]])
         vec = embedding.embed("测试文本")
-        assert len(vec) == 128
+        assert len(vec) == 1
+        assert len(vec[0]) == 128
 
-        # 测试批量嵌入
+        # 测试批量嵌入 (embed accepts a list of texts)
         texts = ["文本1", "文本2", "文本3"]
-        vectors = embedding.embed_batch(texts)
+        vectors = embedding.embed(texts)
         assert len(vectors) == 3
         assert all(len(v) == 128 for v in vectors)
         print(f"\n批量嵌入: {len(vectors)} 个向量，每个 {len(vectors[0])} 维")
@@ -332,37 +322,36 @@ class TestLLMEmbeddings:
 
     @requires_api_key
     def test_embeddings_single(self, deepseek_engine):
-        """测试单个文本嵌入"""
+        """Single-text embeddings. DeepSeek does not expose an embeddings
+        endpoint, so a 404 is a real (expected) response -> skip; any other
+        error surfaces as a failure rather than being swallowed."""
         try:
             embeddings = deepseek_engine.embeddings("Hello World")
-
-            assert isinstance(embeddings, list)
-            assert len(embeddings) == 1
-            assert isinstance(embeddings[0], list)
-            assert all(isinstance(x, float) for x in embeddings[0])
-            assert len(embeddings[0]) > 0
-            print(f"\n嵌入向量维度: {len(embeddings[0])}")
-        except Exception as e:
-            # DeepSeek 可能不支持嵌入 API，跳过
-            if "404" in str(e) or "not found" in str(e).lower():
-                pytest.skip("DeepSeek 不支持嵌入 API")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                pytest.skip("DeepSeek does not expose an embeddings API (404)")
             raise
+        assert isinstance(embeddings, list)
+        assert len(embeddings) == 1
+        assert isinstance(embeddings[0], list)
+        assert all(isinstance(x, float) for x in embeddings[0])
+        assert len(embeddings[0]) > 0
+        print(f"\n嵌入向量维度: {len(embeddings[0])}")
 
     @requires_api_key
     def test_embeddings_batch(self, deepseek_engine):
-        """测试批量文本嵌入"""
+        """Batch embeddings. Same 404-skip semantics as the single test."""
+        texts = ["Python", "JavaScript", "Go"]
         try:
-            texts = ["Python", "JavaScript", "Go"]
             embeddings = deepseek_engine.embeddings(texts)
-
-            assert isinstance(embeddings, list)
-            assert len(embeddings) == 3
-            assert all(len(e) > 0 for e in embeddings)
-            print(f"\n批量嵌入: {len(embeddings)} 个向量")
-        except Exception as e:
-            if "404" in str(e) or "not found" in str(e).lower():
-                pytest.skip("DeepSeek 不支持嵌入 API")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                pytest.skip("DeepSeek does not expose an embeddings API (404)")
             raise
+        assert isinstance(embeddings, list)
+        assert len(embeddings) == 3
+        assert all(len(e) > 0 for e in embeddings)
+        print(f"\n批量嵌入: {len(embeddings)} 个向量")
 
 
 if __name__ == "__main__":

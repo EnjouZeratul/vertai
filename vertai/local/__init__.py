@@ -1,20 +1,23 @@
-"""本地模型模块
+"""Local model module.
 
-支持本地化小模型的下载和调用，无需云端 API。
+Download and run small local models (Whisper, sentence-transformers) without a
+cloud API.
 """
 
 from vertai.local.models import (
-    LocalModelManager,
+    EmbeddingModel,
     LocalModelConfig,
+    LocalModelInfo,
+    LocalModelManager,
     ModelCategory,
     ModelInfo,
     WhisperModel,
-    EmbeddingModel,
 )
 
 __all__ = [
     "LocalModelManager",
     "LocalModelConfig",
+    "LocalModelInfo",
     "ModelCategory",
     "ModelInfo",
     "WhisperModel",
